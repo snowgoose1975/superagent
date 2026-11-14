@@ -1,8 +1,8 @@
 # C 模块全面增强方案（规划档案）
 
-本文件保留 2026-11-13 方案形成时的设计背景；其中“当前状态”均指当时的基线，不作为现在的实现状态。用户随后授权按 H0–H7 实施，当前工作区状态与验证范围见 [`c-implementation-handoff.md`](c-implementation-handoff.md) 和 [`VALIDATION.md`](VALIDATION.md)。
+本文件保留 2026-11-13 方案形成时的设计背景；其中“当前状态”均指当时的基线，不作为现在的实现状态。工作区已完成 H0–H10；当前能力和验证范围见 [`c-implementation-handoff.md`](c-implementation-handoff.md) 和 [`VALIDATION.md`](VALIDATION.md)。
 
-需要交接实施时，阅读 [`c-implementation-handoff.md`](c-implementation-handoff.md)：其中给出 H0—H7 工作包、明确参数范围、兼容策略、文件地图、验收矩阵和可复制提示词。本文保留设计背景，具体执行细节以交接总纲为准。
+需要交接实施背景时，阅读 [`c-implementation-handoff.md`](c-implementation-handoff.md)：其中保留 H0—H7 原始工作包、H8—H10 当前状态、明确参数范围、兼容策略、文件地图和验收矩阵。本文保留设计背景，当前代码事实与执行证据以交接总纲和 [`VALIDATION.md`](VALIDATION.md) 为准。
 
 ## 0. 按课程完整要求修订（2026-11-13）
 

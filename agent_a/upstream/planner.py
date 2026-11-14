@@ -7,8 +7,11 @@ from typing import Any
 from executor_c.model_registry import (
     MODELS,
     candidates_for_profile,
+    default_pipeline,
     models_for_profile,
     normalize_params,
+    normalize_pipeline,
+    text_pipeline_candidates,
 )
 
 WIDE_FEATURE_THRESHOLD = 500
@@ -20,6 +23,20 @@ def params_key(model: str, params: dict[str, Any]) -> tuple[str, str]:
     except ValueError:
         normalized = params
     return model, json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def recipe_key(
+    model: str,
+    params: dict[str, Any],
+    pipeline: dict[str, Any] | None,
+    representation: str,
+) -> tuple[str, str]:
+    """Identify a complete registered experiment, including its fitted representation."""
+    normalized = normalize_params(model, params)
+    recipe: dict[str, Any] = {"params": normalized}
+    if representation == "raw_text":
+        recipe["pipeline"] = normalize_pipeline(representation, pipeline or {})
+    return model, json.dumps(recipe, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def make_plan(
@@ -63,6 +80,7 @@ class Planner:
         capabilities = context.get("capabilities", {})
         models = capabilities.get("models", {})
         representations = overview.get("representations", ["dense_numeric"])
+        representation = representations[0] if representations else "dense_numeric"
         available = [
             model_id for model_id in models
             if model_id in MODELS
@@ -78,7 +96,15 @@ class Planner:
             model_id: candidates_for_profile(model_id, profile)
             for model_id in available
         }
-        tried = {params_key(item["model"], item["params"]) for item in history}
+        tried = {
+            recipe_key(
+                item["model"],
+                item["params"],
+                item.get("pipeline"),
+                item.get("representation", representation),
+            )
+            for item in history
+        }
         successful = [
             item for item in history
             if item.get("status") == "success" and item.get("metric_value") is not None
@@ -88,12 +114,33 @@ class Planner:
             if successful else None
         )
 
-        def build(model_id: str, params: dict[str, Any], reason: str) -> dict[str, Any]:
+        if representation == "raw_text":
+            pipeline_options: list[dict[str, Any] | None] = text_pipeline_candidates(
+                int(overview.get("n_features") or 1)
+            )
+        elif representation == "image_tensor":
+            pipeline_options = [default_pipeline(representation)]
+        else:
+            pipeline_options = [None]
+
+        def build(
+            model_id: str,
+            params: dict[str, Any],
+            pipeline: dict[str, Any] | None,
+            reason: str,
+        ) -> dict[str, Any]:
+            plan = make_plan(
+                task_id, data_version, self.new_experiment_id(), model_id, params,
+                self.seed + len(history), timeout,
+            )
+            if representation != "dense_numeric":
+                plan.update(
+                    schema_version="2.0",
+                    representation=representation,
+                    pipeline=pipeline or default_pipeline(representation),
+                )
             return {
-                "plan": make_plan(
-                    task_id, data_version, self.new_experiment_id(), model_id, params,
-                    self.seed + len(history), timeout,
-                ),
+                "plan": plan,
                 "reason": reason,
             }
 
@@ -105,21 +152,32 @@ class Planner:
 
         # Give each supported family one chance before tuning any family.
         for model_id in ordered:
-            for params in spaces[model_id][:1]:
-                if params_key(model_id, params) not in tried:
-                    return build(
-                        model_id, params,
-                        f"run {model_id.replace('_', '-')} baseline using {profile} profile",
-                    )
+            for pipeline in pipeline_options:
+                for params in spaces[model_id][:1]:
+                    if recipe_key(model_id, params, pipeline, representation) not in tried:
+                        mode = (
+                            " with text strategy "
+                            + json.dumps(pipeline["text_vectorizer"]["params"], sort_keys=True)
+                            if representation == "raw_text" and pipeline is not None
+                            else ""
+                        )
+                        return build(
+                            model_id,
+                            params,
+                            pipeline,
+                            f"run {model_id.replace('_', '-')} baseline{mode} using {profile} profile",
+                        )
 
         if best is not None and best["model"] in spaces:
             model_id = best["model"]
-            for params in spaces[model_id]:
-                if params_key(model_id, params) not in tried:
-                    return build(model_id, params, f"refine best {model_id} configuration")
+            for pipeline in pipeline_options:
+                for params in spaces[model_id]:
+                    if recipe_key(model_id, params, pipeline, representation) not in tried:
+                        return build(model_id, params, pipeline, f"refine best {model_id} configuration")
 
         for model_id in ordered:
-            for params in spaces[model_id]:
-                if params_key(model_id, params) not in tried:
-                    return build(model_id, params, f"explore {model_id} candidate")
+            for pipeline in pipeline_options:
+                for params in spaces[model_id]:
+                    if recipe_key(model_id, params, pipeline, representation) not in tried:
+                        return build(model_id, params, pipeline, f"explore {model_id} candidate")
         return None

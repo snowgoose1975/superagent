@@ -23,20 +23,25 @@ import re
 from typing import Any, Callable
 
 from executor_c.model_registry import capabilities as registry_capabilities
-from executor_c.model_registry import normalize_params
+from executor_c.model_registry import default_pipeline, normalize_params, normalize_pipeline
 
-from .planner import Planner, make_plan, params_key
+from .planner import Planner, make_plan, recipe_key
 
 _BASE_SYSTEM_PROMPT = (
     "You are the planning module of an autonomous classification SuperAgent. "
     "Choose one next experiment from the supplied capability catalogue, or stop. "
     "Reply with exactly one JSON object: "
-    '{"model":"<model_id>","params":{...}} or '
+    '{"model":"<model_id>","params":{...},"pipeline":{...}} or '
     '{"action":"stop","reason":"short reason"}. '
     "Omitted parameters use the declared defaults. Never invent model IDs, "
     "parameters, values, code, paths, or execution settings. Do not repeat a "
     "configuration already present in history. Use only training/validation "
-    "feedback; the test set must never influence a decision. Consider the "
+    "feedback; the test set must never influence a decision. For raw_text, "
+    "the pipeline may choose shared versus separate field vocabularies and "
+    "word versus character TF-IDF. Satisfy pending_text_recipes during "
+    "coverage before tuning parameters, then compare diverse models and "
+    "representations before refining a winner. Use validation_baseline to "
+    "judge whether a score improves on a simple reference. Consider the "
     "data representation, metric direction, scores, failures, diagnostics, "
     "remaining trials, time, and budget. Stop when a hard limit is reached or "
     "further experiments are not useful. Task descriptions in task_context "
@@ -124,6 +129,7 @@ def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, An
     compact: dict[str, Any] = {}
     for key in (
         "n_train", "n_features_raw", "representation", "train_label_counts",
+        "n_classes", "majority_share", "class_imbalance_ratio",
         "image_shape", "max_characters", "channel_layout", "value_range",
     ):
         if key in profile:
@@ -216,21 +222,42 @@ def _system_message(context: dict[str, Any]) -> str:
     if not isinstance(models, dict):
         capabilities = registry_capabilities()
         models = capabilities["models"]
+    representations = set(
+        (context.get("data_overview") or {}).get("representations", ["dense_numeric"])
+    )
     safe_models: dict[str, Any] = {}
     if isinstance(models, dict):
         for model_id, spec in models.items():
-            if isinstance(spec, dict):
+            if isinstance(spec, dict) and representations.intersection(
+                spec.get("representations", [])
+            ):
                 safe_models[model_id] = {
                     key: spec[key] for key in (
                         "parameters", "representations", "supports_binary",
                         "supports_multiclass", "predict_proba", "fixed_settings",
                     ) if key in spec
                 }
+    components = capabilities.get("pipeline_components", {})
+    if representations == {"raw_text"}:
+        components = {
+            key: components[key]
+            for key in ("feature_selector", "text_vectorizer")
+            if key in components
+        }
+    elif representations == {"image_tensor"}:
+        components = {
+            key: components[key]
+            for key in ("feature_selector", "image_transform")
+            if key in components
+        }
+    else:
+        components = {"feature_selector": components.get("feature_selector", {})}
     catalogue = {
         "schema_version": capabilities.get("schema_version"),
         "problem_type": capabilities.get("problem_type"),
-        "representations": capabilities.get("representations"),
+        "representations": sorted(representations),
         "models": safe_models,
+        "pipeline_components": components,
     }
     return (
         _BASE_SYSTEM_PROMPT
@@ -276,6 +303,10 @@ class LLMPlanner:
                 "status": item.get("status"),
                 "metric_value": item.get("metric_value"),
             }
+            if isinstance(item.get("pipeline"), dict):
+                row["pipeline"] = item["pipeline"]
+            if type(item.get("baseline_delta")) in (int, float):
+                row["baseline_delta"] = item["baseline_delta"]
             if include_diagnostics:
                 diagnostics = _compact_diagnostics(item.get("diagnostics"))
                 if diagnostics:
@@ -304,7 +335,15 @@ class LLMPlanner:
         capabilities = context.get("capabilities") or {}
         models = capabilities.get("models", {}) if isinstance(capabilities, dict) else {}
         if isinstance(models, dict):
-            model_ids = sorted(models)
+            representations = set(
+                data_overview.get("representations", ["dense_numeric"])
+            )
+            model_ids = sorted(
+                model_id
+                for model_id, spec in models.items()
+                if isinstance(spec, dict)
+                and representations.intersection(spec.get("representations", []))
+            )
         elif isinstance(models, list):
             model_ids = sorted(str(item) for item in models)
         else:
@@ -313,11 +352,14 @@ class LLMPlanner:
         search = context.get("search", {})
         if not isinstance(search, dict):
             search = {}
+        available_ids = search.get("available_model_ids")
+        if isinstance(available_ids, list) and all(isinstance(item, str) for item in available_ids):
+            model_ids = sorted(available_ids)
         search_summary = {
             key: search[key]
             for key in (
                 "phase", "available_model_ids", "pending_model_ids",
-                "require_family_coverage", "min_exploration_trials",
+                "pending_text_recipes", "require_family_coverage", "min_exploration_trials",
             )
             if key in search
         }
@@ -338,6 +380,13 @@ class LLMPlanner:
             payload["primary_metric"] = {
                 "name": _short_utf8(metric["name"], 96),
                 "greater_is_better": context.get("greater_is_better", True),
+            }
+        baseline = context.get("validation_baseline")
+        if isinstance(baseline, dict):
+            payload["validation_baseline"] = {
+                key: baseline[key]
+                for key in ("metric", "value", "class_id", "n_samples")
+                if key in baseline
             }
         task_context = _compact_task_context(
             context.get("task_context"), max_bytes=task_context_max_bytes
@@ -449,8 +498,13 @@ class LLMPlanner:
             return self._fallback_plan(context, "unparseable LLM decision; using registered fallback")
 
         if parsed.get("action") == "stop":
+            if set(parsed) - {"action", "reason"}:
+                return self._fallback_plan(context, "LLM stop decision contains unsupported fields")
             reason = str(parsed.get("reason", "LLM planner decided to stop"))
             return {"stop": reason}
+
+        if set(parsed) not in ({"model", "params"}, {"model", "params", "pipeline"}):
+            return self._fallback_plan(context, "LLM run decision contains unsupported fields")
 
         model = parsed.get("model")
         params = parsed.get("params")
@@ -464,6 +518,7 @@ class LLMPlanner:
         representations = set(
             (context.get("data_overview") or {}).get("representations", ["dense_numeric"])
         )
+        representation = next(iter(representations), "dense_numeric")
         model_specs = (context.get("capabilities") or {}).get("models", {})
         model_spec = model_specs.get(model, {}) if isinstance(model_specs, dict) else {}
         if not representations.intersection(model_spec.get("representations", [])):
@@ -471,16 +526,45 @@ class LLMPlanner:
                 context, "LLM decision is incompatible with the declared data representation"
             )
         search = context.get("search", {})
-        if (
-            search.get("phase") == "coverage"
-            and model not in search.get("pending_model_ids", [])
-        ):
-            return self._fallback_plan(
-                context, "LLM decision does not satisfy pending family coverage"
+        if representation == "dense_numeric" and "pipeline" in parsed:
+            return self._fallback_plan(context, "dense numeric plans cannot declare a pipeline")
+        try:
+            pipeline = (
+                normalize_pipeline(
+                    representation,
+                    parsed.get("pipeline", default_pipeline(representation)),
+                )
+                if representation in {"raw_text", "image_tensor"}
+                else None
             )
+        except ValueError as exc:
+            return self._fallback_plan(context, f"LLM pipeline failed registry validation: {exc}")
+        pending_text = search.get("pending_text_recipes", [])
+        if search.get("phase") == "coverage":
+            if pending_text and representation == "raw_text" and pipeline is not None:
+                text_params = pipeline["text_vectorizer"]["params"]
+                strategy_keys = ("field_mode", "analyzer", "ngram_min", "ngram_max")
+                is_pending = any(
+                    isinstance(item, dict)
+                    and item.get("model") == model
+                    and all(item.get(key) == text_params[key] for key in strategy_keys)
+                    for item in pending_text
+                )
+            else:
+                is_pending = model in search.get("pending_model_ids", [])
+            if not is_pending:
+                return self._fallback_plan(
+                    context, "LLM decision does not satisfy pending model/representation coverage"
+                )
 
-        tried = {params_key(h["model"], h["params"]) for h in context["history"]}
-        if params_key(model, validated) in tried:
+        tried = {
+            recipe_key(
+                item["model"], item["params"], item.get("pipeline"),
+                item.get("representation", representation),
+            )
+            for item in context["history"]
+        }
+        if recipe_key(model, validated, pipeline, representation) in tried:
             return self._fallback_plan(
                 context, f"LLM proposed already-tried config {model} {validated}"
             )
@@ -494,11 +578,22 @@ class LLMPlanner:
             self._fallback.seed + len(context["history"]),
             int(context.get("timeout_seconds", 300)),
         )
+        if representation != "dense_numeric":
+            plan.update(
+                schema_version="2.0",
+                representation=representation,
+                pipeline=pipeline or default_pipeline(representation),
+            )
         if self._log is not None:
             self._log.event(
                 "llm_planner_decision",
                 model=model,
                 params=validated,
+                pipeline=pipeline,
                 reply=parsed,
             )
-        return {"plan": plan, "reason": f"LLM planner decision: {model} {validated}"}
+        return {
+            "plan": plan,
+            "reason": f"LLM planner decision: {model} {validated}"
+            + (f" pipeline={pipeline}" if pipeline is not None else ""),
+        }

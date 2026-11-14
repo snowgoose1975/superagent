@@ -142,3 +142,76 @@ def evaluate(
     if output_path is not None:
         write_json(Path(output_path), evaluation, exclusive=True)
     return evaluation
+
+
+def evaluate_training_majority_baseline(
+    evaluation_manifest_path: Path,
+    training_label_counts: dict[str, int],
+) -> dict[str, Any]:
+    """Score a training-derived majority/probability baseline on validation only."""
+    evaluation_manifest_path = Path(evaluation_manifest_path).expanduser().resolve(strict=True)
+    evaluation_manifest = read_json(evaluation_manifest_path, "DATA_INVALID")
+    expected_fields = {
+        "schema_version", "task_id", "data_version", "data_manifest_path",
+        "labels_path", "primary_metric", "positive_class_id",
+    }
+    if set(evaluation_manifest) != expected_fields or evaluation_manifest.get("schema_version") != "1.0":
+        raise ValueError("evaluation_manifest 字段缺失、未知或版本不受支持")
+    metric = validate_metric_spec(evaluation_manifest["primary_metric"])
+    data_manifest_path = _resolve_manifest_file(
+        evaluation_manifest_path, evaluation_manifest["data_manifest_path"]
+    )
+    data_manifest = read_json(data_manifest_path, "DATA_INVALID")
+    if (
+        data_manifest.get("task_id") != evaluation_manifest.get("task_id")
+        or data_manifest.get("data_version") != evaluation_manifest.get("data_version")
+    ):
+        raise ValueError("evaluation_manifest 与 B data_manifest 的任务身份不一致")
+    classes = data_manifest.get("classes")
+    if (
+        not isinstance(classes, list)
+        or len(classes) < 2
+        or [item.get("id") if isinstance(item, dict) else None for item in classes]
+        != list(range(len(classes)))
+        or not isinstance(training_label_counts, dict)
+    ):
+        raise ValueError("无法从训练类别统计建立 majority baseline")
+    counts = [training_label_counts.get(item.get("name")) for item in classes]
+    if any(type(count) is not int or count < 0 for count in counts) or sum(counts) <= 0:
+        raise ValueError("训练类别计数缺失或非法")
+    probabilities_row = [count / sum(counts) for count in counts]
+    class_id = max(range(len(counts)), key=lambda index: counts[index])
+    labels_path = _resolve_manifest_file(
+        evaluation_manifest_path, evaluation_manifest["labels_path"]
+    )
+    label_rows = _read_csv(labels_path, ["sample_id", "y_true"])
+    labels: list[int] = []
+    seen: set[str] = set()
+    for row in label_rows:
+        sample_id, label_text = row
+        if not sample_id.strip() or sample_id in seen:
+            raise ValueError("验证标签 sample_id 为空或重复")
+        seen.add(sample_id)
+        try:
+            label = int(label_text)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("验证 y_true 必须是整数类别") from exc
+        if str(label) != label_text or label not in range(len(classes)):
+            raise ValueError("验证 y_true 含未知类别")
+        labels.append(label)
+    if not labels:
+        raise ValueError("验证标签不能为空")
+    value = score_predictions(
+        metric["name"],
+        labels,
+        [class_id] * len(labels),
+        [probabilities_row] * len(labels),
+        list(range(len(classes))),
+    )
+    return {
+        "type": "training_majority",
+        "metric": metric["name"],
+        "value": value,
+        "class_id": class_id,
+        "n_samples": len(labels),
+    }

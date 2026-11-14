@@ -11,7 +11,7 @@ no_proxy=aigc-api.hkust-gz.edu.cn \
 
 换任务只需替换 `--task` 后的目录。程序自动读取 README/info 和训练数据，识别特征、标签、模态及指标，生成 session 内部契约并搜索；按 validation 选优冻结后再读 test、打印最终指标。无需编写或修改数据集 JSON。学校模式沿用项目 `.env` 的 key，自动任务默认最多 20 次模型调用、20 次实验和每任务 20 元参考价账本；同一训练输入重复启动复用预算。省略 `--planner school` 可离线运行相同数据流程。
 
-目前自动入口支持课程现有的 NPY 数组包和 CSV 分区（表格/纯文本），以及 NPY 图像张量。说明提取规则、输入边界和输出见 [`docs/task-directory.md`](docs/task-directory.md)。下方 `--config` 命令保留为开发兼容入口。
+目前自动入口支持课程现有的 NPY 数组包和 CSV 分区（表格/纯文本），以及 NPY 图像张量。增强搜索按识别出的模态和训练画像评估注册模型族；多字段文本可比较共享/逐字段 word/character TF-IDF 以及三种稀疏文本分类器。程序还会报告训练多数类 validation 基线，便于判断最终方案是否优于简单参考。模型与预处理依然由有限注册表实现，A 负责选择配方并读取 validation 反馈，不会生成可执行代码。它会在质量、patience、时间、调用数、实验数或费用上限允许的范围内探索；20 元是上限，不要求花完。说明提取规则、输入边界和输出见 [`docs/task-directory.md`](docs/task-directory.md)。下方 `--config` 命令保留为开发兼容入口。
 
 Table tasks keep TaskSpec 1.0. Bounded text and image-array classification use TaskSpec 2.0; see [`docs/multimodal-tasks.md`](docs/multimodal-tasks.md). For a configured multi-trial offline search, add `--search-config configs/search-defaults.json` to `main.py run`.
 

@@ -33,13 +33,19 @@ TaskSpec 1.0 remains the table route. TaskSpec 2.0 adds bounded raw-text and ima
 
 Use `source_format: "text_array_package"` and `modality.kind: "text"`. Each feature file is an NPY matrix with one column per declared text field. A single text column may also use a one-dimensional NPY array. Primitive Unicode/byte arrays and safely parsed object arrays are accepted; each element must decode to a string. The reader limits each element to `max_characters`, allows at most eight columns, and caps a partition at eight million total characters. B republishes text as bounded JSONL, avoiding NPY fixed-width string expansion.
 
-The supported text classifier is LogisticRegression with a registered TF-IDF vectorizer. Word or character analysis, n-gram bounds, document frequency, and vocabulary size have finite registry limits. C fits the vectorizer on train only and keeps it inside the frozen model pipeline. No user code or dynamic sklearn class names are accepted.
+The registered text classifiers are LogisticRegression, MultinomialNB, and ComplementNB. TF-IDF supports word unigrams or character 2–5-grams. For multiple input fields, the planner can use one shared vocabulary or fit an independent vocabulary per field; the feature names and field identities are preserved in the frozen pipeline. When there are enough trials, default expanded search first covers the compatible model/representation combinations before refining parameters. Vectorizer and classifier choices have finite registry limits. C fits every text transform on train only and keeps the fitted transform inside the frozen model pipeline. No user code or dynamic sklearn class names are accepted.
 
 ## Image arrays
 
 Use `source_format: "image_array_package"` and `modality.kind: "image"`. Each feature file is an NPY tensor shaped `(N, H, W)` for `HW`, or `(N, H, W, C)` for `HWC`. `image_shape` declares one sample's dimensions, and `value_range` declares inclusive finite pixel bounds. A sample is limited to one million values; NPY reader limits also bound total array size.
 
 The registered image baseline scales the declared pixel interval to `[0, 1]`, flattens each image, and then runs a whitelisted classifier. This is a stable classical baseline, not a CNN and not a claim that flattening is best for visual tasks. Supported image classifiers are RandomForest, ExtraTrees, HistGradientBoosting, and LogisticRegression. Optional feature selection is the registered `VarianceThreshold` component.
+
+## Generic search and reference score
+
+For every supported classification task, main derives class counts from training labels and scores a constant training-majority prediction on validation. For log loss it also scores the training class-prior probability vector. A receives only the metric value and class ID, never validation labels. The baseline diagnoses whether candidates beat a simple reference; it does not constrain the task to a particular model or dataset.
+
+The registry supplies model families and finite candidate sets. Expanded search tracks the complete recipe (model, parameters, and text pipeline), so two vectorization strategies with the same classifier parameters remain distinct experiments. The planner stops at configured experiment, time, budget, failure, and patience limits; the monetary budget is a ceiling rather than a target to exhaust.
 
 ## Plan and prediction behavior
 

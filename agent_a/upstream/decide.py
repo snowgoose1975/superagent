@@ -37,11 +37,14 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
     search = context.get("search") or {}
     expanded = context.get("search_profile") == "expanded"
     pending = search.get("pending_model_ids", [])
+    pending_recipes = search.get("pending_text_recipes", [])
+    coverage_size = len(pending_recipes) if pending_recipes else len(pending)
     coverage_active = (
         expanded
         and search.get("phase") == "coverage"
         and isinstance(pending, list)
-        and len(history) + len(pending) <= max_experiments
+        and isinstance(pending_recipes, list)
+        and len(history) + coverage_size <= max_experiments
     )
 
     if remaining is not None and remaining <= 0.0:

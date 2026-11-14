@@ -4,13 +4,15 @@ main 负责组装 A/B/C/D。A 的实现可以替换，B 的准备数据协议、
 
 ## A 的控制器
 
-main 调用控制器 `decide(context: dict) -> dict`。上下文包含训练概况、任务指标、C 能力清单、先前 history 和 `remaining_trials`；自动任务还包含 README/info 的有界 `task_context` 摘要，其属于不可信任务数据。A 不接收验证标签或 test 数据。每条 history 项记录 experiment ID、decision/plan、C 结果路径和状态；只有成功评分项提供 `evaluation.value`。
+main 调用控制器 `decide(context: dict) -> dict`。上下文包含训练概况、任务指标、训练多数类 validation baseline、C 能力清单、先前 history 和 `remaining_trials`；自动任务还包含 README/info 的有界 `task_context` 摘要，其属于不可信任务数据。A 不接收验证标签或 test 数据。每条 history 项记录 experiment ID、decision/plan、C 结果路径和状态；成功评分项还可包含相对 baseline 的方向化差值。
 
 A 返回：
 
 ```python
 {"action": "run", "model": "random_forest", "params": {"n_estimators": 100}, "reason": "..."}
 ```
+
+对 Plan 2.0 的文本/图像任务，A 还可返回注册表内的 `pipeline`；文本 pipeline 会随模型和参数一起去重、保存并冻结。表示选择仍是有限白名单，不生成或执行代码。
 
 或者明确停止：
 
@@ -23,7 +25,7 @@ A 返回：
 ## 两种规划模式
 
 - `offline` 是默认模式，使用同学 A 的规则 planner；不联网、不需要 key，summary 的真实 LLM 调用数为 0。
-- `school` 复用同学 A 的 `LLMPlanner` 生成模型与参数。它只接收训练概况、C 能力和历史 validation 分数，不读取 test，不生成或执行任意代码。请求经 `evaluation_d/school_gateway.py` 发送并记账，A 不直接访问 HTTP。
+- `school` 复用同学 A 的 `LLMPlanner` 生成模型、参数和可选的声明式 pipeline。它只接收训练概况、任务说明摘要、validation baseline、C 能力和历史 validation 分数，不读取验证标签或 test，不生成或执行任意代码。请求经 `evaluation_d/school_gateway.py` 发送并记账，A 不直接访问 HTTP。
 
 - 可选 `--test-config` 只在 validation 最优 bundle 冻结后进入 `evaluation_d/final_test.py`。它调用冻结预测器并按任务 primary metric 评分；test 结果只写最终 session 报告和终端，不回流 A、history 或模型选择。已冻结 bundle 可通过 `evaluate-test` 子命令独立补评。
 
@@ -39,6 +41,8 @@ school 模式下 `--llm-max-calls` 限制本次主会话的请求尝试数量。
 - **D 学校网关**：`SchoolGateway.call_llm(messages) -> {text, input_tokens, output_tokens, cost_rmb}`，独立负责学校 HTTP 请求、限额、预算预留和账本。key 从 `evaluation_d/env_config.py` 加载后仅注入网关，不进入 A 的提示词；网关在内存中处理消息，账本只写元数据。
 
 TaskSpec 2.0 文本/图像文件格式、资源上限、模型兼容表和预测行为见 [`multimodal-tasks.md`](multimodal-tasks.md)。新增的全流程只使用固定 TF-IDF 或图像展平缩放组件；C 不执行 LLM 生成代码。
+
+增强文本搜索会在有足够实验轮数时先覆盖 LogisticRegression、MultinomialNB、ComplementNB 与共享/逐字段的 word/character TF-IDF 组合，再进入参数细化。validation baseline 只用训练类别频率建立多数类预测或先验概率基线；它帮助发现明显弱于简单参考的方案，不作为自动拒绝规则。
 
 ## CLI
 

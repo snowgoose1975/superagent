@@ -15,6 +15,7 @@ from data_b.modality_readers import (
 )
 from data_b.raw_reader import load_feature_frame
 from executor_c.contracts import read_json, resolve_data_path, sha256_file
+from executor_c.model_registry import normalize_pipeline
 
 
 def predict_bundle(
@@ -57,7 +58,12 @@ def predict_bundle(
                 modality["text_columns"],
                 max_characters=modality["max_characters"],
             )
-            X = combine_text_columns(X, modality["text_columns"])
+            frozen_plan = read_json(
+                resolve_data_path(path.parent, "plan.json"), error_code="FINAL_BUNDLE_INVALID"
+            )
+            pipeline = normalize_pipeline(representation, frozen_plan.get("pipeline", {}))
+            if pipeline["text_vectorizer"]["params"]["field_mode"] != "separate":
+                X = combine_text_columns(X, modality["text_columns"])
         elif representation == "image_tensor" and isinstance(modality, dict):
             X = load_image_tensor(
                 feature_path,

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 CAPABILITY_SCHEMA_VERSION = "2.0"
-REGISTRY_VERSION = "1.0"
+REGISTRY_VERSION = "1.1"
 MAX_TIMEOUT_SECONDS = 600
 
 
@@ -110,6 +110,30 @@ MODELS: dict[str, Model] = {
             {"C": 1.0, "max_iter": 1000}, {"C": 0.1, "max_iter": 1000},
             {"C": 10.0, "max_iter": 1000}, {"C": 0.3, "max_iter": 1500},
             {"C": 3.0, "max_iter": 1500},
+        ),
+    ),
+    "multinomial_nb": Model(
+        "multinomial_nb",
+        "multinomial_nb",
+        {"alpha": Parameter("number", 1.0, 0.0, 100.0, exclusive_minimum=True)},
+        {"fit_prior": True},
+        representations=("raw_text",),
+        candidates=(
+            {"alpha": 0.1},
+            {"alpha": 1.0},
+            {"alpha": 10.0},
+        ),
+    ),
+    "complement_nb": Model(
+        "complement_nb",
+        "complement_nb",
+        {"alpha": Parameter("number", 1.0, 0.0, 100.0, exclusive_minimum=True)},
+        {"fit_prior": True},
+        representations=("raw_text",),
+        candidates=(
+            {"alpha": 0.1},
+            {"alpha": 1.0},
+            {"alpha": 10.0},
         ),
     ),
     "extra_trees": Model(
@@ -231,7 +255,14 @@ def capabilities() -> dict[str, Any]:
             },
             "text_vectorizer": {
                 "tfidf": {
+                    "candidate_strategies": [
+                        {"field_mode": "shared", "analyzer": "word", "ngram_min": 1, "ngram_max": 1},
+                        {"field_mode": "separate", "analyzer": "word", "ngram_min": 1, "ngram_max": 1},
+                        {"field_mode": "shared", "analyzer": "char", "ngram_min": 2, "ngram_max": 5},
+                        {"field_mode": "separate", "analyzer": "char", "ngram_min": 2, "ngram_max": 5},
+                    ],
                     "parameters": {
+                        "field_mode": {"type": "enum", "choices": ["shared", "separate"]},
                         "analyzer": {"type": "enum", "choices": ["word", "char"]},
                         "ngram_min": {"type": "integer", "minimum": 1, "maximum": 5},
                         "ngram_max": {"type": "integer", "minimum": 1, "maximum": 5},
@@ -257,6 +288,7 @@ def default_pipeline(representation: str) -> dict[str, Any]:
         pipeline["text_vectorizer"] = {
             "name": "tfidf",
             "params": {
+                "field_mode": "shared",
                 "analyzer": "word",
                 "ngram_min": 1,
                 "ngram_max": 1,
@@ -269,6 +301,26 @@ def default_pipeline(representation: str) -> dict[str, Any]:
     elif representation != "dense_numeric":
         raise ValueError("representation is not supported by the pipeline registry")
     return pipeline
+
+
+def text_pipeline_candidates(n_features: int) -> list[dict[str, Any]]:
+    """Return a small, representation-diverse starting portfolio for raw text."""
+    if type(n_features) is not int or n_features < 1:
+        raise ValueError("n_features must be a positive integer")
+    modes = ("shared", "separate") if n_features > 1 else ("shared",)
+    candidates = []
+    for analyzer, ngram_min, ngram_max in (("word", 1, 1), ("char", 2, 5)):
+        for field_mode in modes:
+            pipeline = default_pipeline("raw_text")
+            params = pipeline["text_vectorizer"]["params"]
+            params.update(
+                field_mode=field_mode,
+                analyzer=analyzer,
+                ngram_min=ngram_min,
+                ngram_max=ngram_max,
+            )
+            candidates.append(pipeline)
+    return candidates
 
 
 def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
@@ -319,11 +371,17 @@ def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
         ):
             raise ValueError("raw_text requires the registered tfidf vectorizer")
         params = text["params"]
-        keys = {"analyzer", "ngram_min", "ngram_max", "max_features", "min_df"}
+        keys = {
+            "field_mode", "analyzer", "ngram_min", "ngram_max", "max_features", "min_df"
+        }
         if not isinstance(params, dict) or set(params) - keys:
             raise ValueError("tfidf parameters contain unsupported fields")
         defaults = normalized["text_vectorizer"]["params"]
         values = {name: params.get(name, default) for name, default in defaults.items()}
+        if not isinstance(values["field_mode"], str) or values["field_mode"] not in {
+            "shared", "separate"
+        }:
+            raise ValueError("tfidf field_mode must be shared or separate")
         if not isinstance(values["analyzer"], str) or values["analyzer"] not in {"word", "char"}:
             raise ValueError("tfidf analyzer must be word or char")
         for field, low, high in (

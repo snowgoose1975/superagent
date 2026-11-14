@@ -8,7 +8,11 @@ from typing import Any
 
 from executor_c.contracts import validate_plan
 from executor_c.diagnostics import safe_history_view
-from executor_c.model_registry import models_for_profile
+from executor_c.model_registry import (
+    models_for_profile,
+    normalize_pipeline,
+    text_pipeline_candidates,
+)
 
 from .legacy_controller import OfflineController as OfflineController
 from .upstream.decide import decide as upstream_decide
@@ -105,9 +109,18 @@ class PackageAController:
                     "status": "success" if succeeded else status,
                     "metric_value": value,
                     "duration_seconds": item.get("duration_seconds"),
+                    "baseline_delta": item.get("baseline_delta"),
                     "result_relpath": item.get("result_relpath"),
                     "error": item.get("error"),
                     "diagnostics": safe_history_view(item.get("diagnostics")),
+                    **(
+                        {
+                            "representation": plan["representation"],
+                            "pipeline": copy.deepcopy(plan["pipeline"]),
+                        }
+                        if plan.get("schema_version") == "2.0"
+                        else {}
+                    ),
                 }
             )
         return mapped
@@ -142,17 +155,52 @@ class PackageAController:
             }
             pending = [model for model in available if model not in tried_models]
             remaining = context.get("remaining_trials", 0)
+            pending_text_recipes: list[dict[str, Any]] = []
+            if data_overview["representations"] == ["raw_text"]:
+                tried_recipes = set()
+                for item in self._map_history(context.get("history", [])):
+                    pipeline = normalize_pipeline("raw_text", item.get("pipeline", {}))
+                    params = pipeline["text_vectorizer"]["params"]
+                    strategy = tuple(
+                        params[key]
+                        for key in ("field_mode", "analyzer", "ngram_min", "ngram_max")
+                    )
+                    tried_recipes.add((item["model"], *strategy))
+                pending_text_recipes = [
+                    {
+                        "model": model,
+                        **{
+                            key: pipeline["text_vectorizer"]["params"][key]
+                            for key in ("field_mode", "analyzer", "ngram_min", "ngram_max")
+                        },
+                    }
+                    for model in available
+                    for pipeline in text_pipeline_candidates(self.n_features)
+                    if (
+                        model,
+                        *(
+                            pipeline["text_vectorizer"]["params"][key]
+                            for key in ("field_mode", "analyzer", "ngram_min", "ngram_max")
+                        ),
+                    ) not in tried_recipes
+                ]
+            coverage_size = len(pending_text_recipes) or len(pending)
             coverage_possible = (
                 bool(search.get("require_family_coverage", True))
                 and type(remaining) is int
-                and remaining >= len(pending)
+                and remaining >= coverage_size
             )
             search["phase"] = "coverage" if coverage_possible and pending else (
                 "refinement" if len(context.get("history", [])) >= search.get(
                     "min_exploration_trials", 8
                 ) else "exploration"
             )
+            if coverage_possible and pending_text_recipes:
+                search["phase"] = "coverage"
             search["pending_model_ids"] = pending if coverage_possible else []
+            search["pending_text_recipes"] = (
+                pending_text_recipes if coverage_possible else []
+            )
             search["available_model_ids"] = available
         return {
             "task_id": self.task_id,
@@ -162,6 +210,7 @@ class PackageAController:
                 "greater_is_better", True
             ),
             "primary_metric": copy.deepcopy(context.get("primary_metric", {})),
+            "validation_baseline": copy.deepcopy(context.get("validation_baseline")),
             "remaining_budget_rmb": remaining_budget,
             "planning_mode": self.mode,
             "max_experiments": self.max_trials,
@@ -196,6 +245,15 @@ class PackageAController:
             "model": proposal["model"],
             "params": self._canonical_params(proposal["model"], proposal["params"]),
             "reason": str(decision.get("reason", "A planner decision"))[:2000],
+            **(
+                {
+                    "pipeline": normalize_pipeline(
+                        proposal["representation"], proposal["pipeline"]
+                    )
+                }
+                if proposal.get("schema_version") == "2.0"
+                else {}
+            ),
         }
 
     def decide(self, context: dict[str, Any]) -> dict[str, Any]:

@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,13 @@ from typing import Any
 from unittest import mock
 
 import numpy as np
+
+from agent_a.upstream.llm_planner import LLMPlanner
+from agent_a.upstream.planner import Planner
+from data_b.modality_readers import combine_text_columns
+from evaluation_d.evaluate import evaluate_training_majority_baseline
+from executor_c.model_factory import build_estimator
+from executor_c.model_registry import capabilities, default_pipeline, normalize_pipeline
 
 import main as team_main
 from evaluation_d.school_gateway import SchoolGateway
@@ -28,8 +36,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 class _OneTrialController:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], pipeline: dict[str, Any] | None = None) -> None:
         self.events = events
+        self.pipeline = pipeline
         self.calls = 0
         self.contexts: list[dict[str, Any]] = []
 
@@ -39,12 +48,15 @@ class _OneTrialController:
         self.events.append("decide")
         self.calls += 1
         self.contexts.append(context)
-        return {
+        decision = {
             "action": "run",
             "model": "logistic_regression",
             "params": {"C": 1.0, "max_iter": 200},
             "reason": "Synthetic automatic-task integration check.",
         }
+        if self.pipeline is not None:
+            decision["pipeline"] = self.pipeline
+        return decision
 
 
 class AutomaticTaskRunTests(unittest.TestCase):
@@ -133,11 +145,16 @@ class AutomaticTaskRunTests(unittest.TestCase):
         return source, {(source / "test.csv").resolve()}
 
     def _run_with_read_audit(
-        self, source: Path, test_paths: set[Path], output_name: str
+        self,
+        source: Path,
+        test_paths: set[Path],
+        output_name: str,
+        *,
+        pipeline: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], Path, _OneTrialController, list[str], str]:
         output_root = self.root / output_name
         events: list[str] = []
-        controller = _OneTrialController(events)
+        controller = _OneTrialController(events, pipeline)
         original_open = Path.open
         original_freeze = team_main.freeze_best
         original_evaluate = team_main.evaluate_frozen_bundle
@@ -219,13 +236,21 @@ class AutomaticTaskRunTests(unittest.TestCase):
 
     def test_csv_text_with_readme_target_runs_and_does_not_open_test_early(self) -> None:
         source, test_paths = self._csv_text_task("unseen_text_pair_task")
-        result = self._run_with_read_audit(source, test_paths, "text_run")
+        pipeline = default_pipeline("raw_text")
+        pipeline["text_vectorizer"]["params"]["field_mode"] = "separate"
+        result = self._run_with_read_audit(
+            source, test_paths, "text_run", pipeline=pipeline
+        )
         self._assert_success(*result)
         summary, output_root = result[:2]
         bundle = _read_json(output_root / summary["bundle_path"])
         self.assertEqual(bundle["schema_version"], "2.0")
         self.assertEqual(bundle["representation"], "raw_text")
         self.assertEqual(bundle["modality"]["text_columns"], ["body_a", "body_b"])
+        history = (output_root / summary["history_path"]).read_text(encoding="utf-8")
+        self.assertIn('"field_mode": "separate"', history)
+        self.assertEqual(summary["validation_baseline"]["metric"], "accuracy")
+        self.assertIn("[Baseline] validation accuracy =", result[4])
 
     def test_final_test_failure_preserves_final_without_partial_or_planner_reentry(self) -> None:
         source, test_paths = self._npy_task(
@@ -405,6 +430,207 @@ class AutomaticTaskRunTests(unittest.TestCase):
                 self.assertEqual(report["metric"], name)
                 self.assertEqual(report["greater_is_better"], name != "log_loss")
                 self.assertTrue(0 <= report["accuracy"] <= 1)
+
+
+class GeneralRecipeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="superagent-general-recipe-"))
+
+    def test_separate_field_text_pipeline_preserves_where_a_signal_occurs(self) -> None:
+        y = np.asarray([0, 1] * 20, dtype=np.int64)
+        X = np.asarray(
+            [["signal", "common"] if label == 0 else ["common", "signal"] for label in y],
+            dtype=object,
+        )
+        modality = {
+            "kind": "text",
+            "text_columns": ["left", "right"],
+            "max_characters": 100,
+        }
+        accuracies = {}
+        for field_mode in ("shared", "separate"):
+            pipeline = default_pipeline("raw_text")
+            pipeline["text_vectorizer"]["params"]["field_mode"] = field_mode
+            model = build_estimator(
+                "logistic_regression",
+                {"C": 1.0, "max_iter": 200},
+                42,
+                representation="raw_text",
+                pipeline=pipeline,
+                modality=modality,
+            )
+            values = combine_text_columns(X, modality["text_columns"]) if field_mode == "shared" else X
+            model.fit(values, y)
+            accuracies[field_mode] = float(np.mean(model.predict(values) == y))
+        self.assertGreater(accuracies["separate"], 0.99)
+        self.assertLess(accuracies["shared"], 0.60)
+
+    def test_default_text_search_covers_model_families_and_field_recipes(self) -> None:
+        legacy_pipeline = default_pipeline("raw_text")
+        legacy_pipeline["text_vectorizer"]["params"].pop("field_mode")
+        self.assertEqual(
+            normalize_pipeline("raw_text", legacy_pipeline), default_pipeline("raw_text")
+        )
+        planner = Planner()
+        context: dict[str, Any] = {
+            "task_id": "task",
+            "data_version": "v1",
+            "history": [],
+            "greater_is_better": True,
+            "timeout_seconds": 120,
+            "search_profile": "expanded",
+            "data_overview": {"n_features": 2, "representations": ["raw_text"]},
+            "capabilities": capabilities(),
+        }
+        recipes = set()
+        for _ in range(12):
+            proposal = planner.next_plan(context)
+            self.assertIsNotNone(proposal)
+            plan = proposal["plan"]
+            self.assertEqual(plan["schema_version"], "2.0")
+            strategy = plan["pipeline"]["text_vectorizer"]["params"]
+            recipes.add(
+                (
+                    plan["model"],
+                    strategy["field_mode"],
+                    strategy["analyzer"],
+                    strategy["ngram_min"],
+                    strategy["ngram_max"],
+                )
+            )
+            context["history"].append(
+                {
+                    "model": plan["model"],
+                    "params": plan["params"],
+                    "pipeline": plan["pipeline"],
+                    "representation": "raw_text",
+                    "status": "success",
+                    "metric_value": None,
+                }
+            )
+        self.assertEqual(len(recipes), 12)
+        self.assertEqual(
+            {recipe[0] for recipe in recipes},
+            {"logistic_regression", "multinomial_nb", "complement_nb"},
+        )
+        self.assertTrue({recipe[2] for recipe in recipes} == {"word", "char"})
+
+    def test_llm_can_choose_and_deduplicate_on_the_full_text_recipe(self) -> None:
+        shared = default_pipeline("raw_text")
+        separate = default_pipeline("raw_text")
+        separate["text_vectorizer"]["params"]["field_mode"] = "separate"
+        reply = {
+            "text": json.dumps(
+                {
+                    "model": "logistic_regression",
+                    "params": {"C": 1.0},
+                    "pipeline": separate,
+                }
+            ),
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cost_rmb": 0.0,
+        }
+        planner = LLMPlanner(lambda _messages: reply, Planner())
+        context: dict[str, Any] = {
+            "task_id": "task",
+            "data_version": "v1",
+            "history": [
+                {
+                    "model": "logistic_regression",
+                    "params": {"C": 1.0},
+                    "pipeline": shared,
+                    "representation": "raw_text",
+                    "status": "success",
+                    "metric_value": 0.51,
+                }
+            ],
+            "greater_is_better": True,
+            "timeout_seconds": 120,
+            "remaining_trials": 5,
+            "data_overview": {"n_train": 30, "n_features": 2, "representations": ["raw_text"]},
+            "capabilities": capabilities(),
+            "search_profile": "expanded",
+            "search": {
+                "phase": "coverage",
+                "pending_model_ids": ["logistic_regression"],
+                "pending_text_recipes": [
+                    {
+                        "model": "logistic_regression",
+                        "field_mode": "separate",
+                        "analyzer": "word",
+                        "ngram_min": 1,
+                        "ngram_max": 1,
+                    }
+                ],
+            },
+        }
+        selected = planner.next_plan(context)
+        self.assertEqual(selected["plan"]["schema_version"], "2.0")
+        self.assertEqual(selected["plan"]["pipeline"], separate)
+
+    def test_training_majority_baseline_is_scored_on_validation(self) -> None:
+        task = self.root / "baseline"
+        task.mkdir()
+        (task / "data_manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "baseline",
+                    "data_version": "v1",
+                    "classes": [
+                        {"id": 0, "name": "minor"},
+                        {"id": 1, "name": "major"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (task / "evaluation_manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "task_id": "baseline",
+                    "data_version": "v1",
+                    "data_manifest_path": "data_manifest.json",
+                    "labels_path": "validation_labels.csv",
+                    "primary_metric": {"name": "accuracy", "greater_is_better": True},
+                    "positive_class_id": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (task / "validation_labels.csv").write_text(
+            "sample_id,y_true\nv1,0\nv2,0\nv3,1\nv4,1\nv5,1\n", encoding="utf-8"
+        )
+        baseline = evaluate_training_majority_baseline(
+            task / "evaluation_manifest.json", {"minor": 2, "major": 8}
+        )
+        self.assertEqual(baseline["class_id"], 1)
+        self.assertEqual(baseline["metric"], "accuracy")
+        self.assertEqual(baseline["value"], 0.6)
+        self.assertEqual(baseline["n_samples"], 5)
+        evaluation_manifest_path = task / "evaluation_manifest.json"
+        evaluation_manifest = _read_json(evaluation_manifest_path)
+        evaluation_manifest["primary_metric"] = {
+            "name": "log_loss", "greater_is_better": False,
+        }
+        evaluation_manifest_path.write_text(
+            json.dumps(evaluation_manifest), encoding="utf-8"
+        )
+        logloss_baseline = evaluate_training_majority_baseline(
+            evaluation_manifest_path, {"minor": 2, "major": 8}
+        )
+        expected_logloss = -(2 * math.log(0.2) + 3 * math.log(0.8)) / 5
+        self.assertTrue(math.isclose(logloss_baseline["value"], expected_logloss))
+        self.assertEqual(logloss_baseline["metric"], "log_loss")
+        manifest_path = task / "data_manifest.json"
+        manifest = _read_json(manifest_path)
+        manifest["data_version"] = "different-version"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "任务身份不一致"):
+            evaluate_training_majority_baseline(
+                task / "evaluation_manifest.json", {"minor": 2, "major": 8}
+            )
 
 
 if __name__ == "__main__":

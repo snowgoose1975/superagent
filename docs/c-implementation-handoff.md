@@ -1,6 +1,6 @@
 # SuperAgent 分类执行模块 C：优化实施交接总纲
 
-版本：2026-11-13；实施状态更新：2026-11-14。H0–H7 已在当前 v2 工作区实现；本文仍是范围和验收规格，实际执行证据与未覆盖项见 [`VALIDATION.md`](VALIDATION.md)。
+版本：2026-11-13；实施状态更新：2026-11-14。H0–H10 已在当前 v2 工作区实现；本文前半保留最初规格与决策依据，最终实现状态、执行证据和未覆盖项见 [`VALIDATION.md`](VALIDATION.md) 及文末“当前实施状态”。
 
 本总纲把 `docs/c-enhancement-plan.md` 细化为工作包。阶段、接口和验收按本文执行；课程原文与用户后续指令优先。当前阶段不引入运行时任意代码生成，不重写整个项目。
 
@@ -10,7 +10,7 @@
 
 第一批必须完成：统一注册表、四类表格分类模型、可靠参数校验、训练诊断、A 真实接通新能力、可配置搜索停止、独立冻结预测和回归验证。四模型是 RF、LR、ExtraTrees、HistGradientBoosting，均支持二分类和多分类。
 
-H5–H7 覆盖任务指标、可组合 Pipeline 与文本/图像输入、正式参考价格账本和报告交付。CatBoost、概率融合、跨会话成功结果缓存和预训练图像模型仍是后置项，不作为当前能力承诺。
+H5–H7 覆盖任务指标、可组合 Pipeline 与文本/图像输入、正式参考价格账本和报告交付；H8–H9 加入冻结后的独立 test 和全自动任务目录；H10 将 A 的完整声明式文本方案贯穿 C、history、冻结预测，并让多字段文本覆盖多个 classifier/vectorizer recipe。CatBoost、概率融合、跨会话成功结果缓存、深度预训练图像模型、任意未知任务格式仍不在当前能力承诺内。
 
 交付应证明系统实际完成了不同方案的自主实验和反馈优化。不能以模型类数量、代码文件数量或是否花满 20 元作为成功标准；不承诺超过当前分数。
 
@@ -478,6 +478,12 @@ pytest/ruff 缺失时可按 requirements-dev.txt 安装到已选项目虚拟环�
 - 文本与图像执行路径已按 TaskSpec/Manifest 2.0 实现为受限基线；不宣称其精度或性能超过针对具体任务设计的视觉/文本方法。
 - 当前依赖范围仍允许多个版本；验证证据只适用于 `VALIDATION.md` 记录的实际环境。pytest/ruff 无法运行时不得声称完整自动回归通过。
 
-## 19. 当前实施状态
+## 19. 当前实施状态（H0–H10）
 
-H0–H7 的变更摘要、精确验证命令、生成工件、测试工具缺失和剩余局限统一记录在 [`VALIDATION.md`](VALIDATION.md)。本文第 14 节的 T01–T18 是需求验收矩阵；不是逐项 pytest 全绿的声明。当前代码支持的范围为注册表中的四种表格模型、声明式 TF-IDF 文本基线和图像展平缩放基线、三个任务指标，以及 opt-in 的任务预算/确定性报告。
+- 当前固定模型白名单包括四种 dense/image 表格分类器（RandomForest、LogisticRegression、ExtraTrees、HistGradientBoosting）和两种 raw-text 稀疏分类器（MultinomialNB、ComplementNB）；LogisticRegression 同时支持 raw text。文本默认起始 portfolio 为三个模型族 × 最多四种文本表示，共 12 个方案；按验证分数和 patience 继续有限搜索。
+- CSV/Numpy 表格、文本和 NPY 图像分类通过统一 `run --task <目录>` 接入；支持 accuracy、macro-F1、log loss。训练多数类/先验概率 validation baseline 用于诊断。test 只在 validation 选优并冻结后独立读取。
+- pipeline 选择属于方案身份并进入 history 与冻结 plan；文本逐字段 TF-IDF 的自动 final-test 回归覆盖 freeze→predict，旧 text plan 缺少 `field_mode` 时维持 shared 默认值。
+- `docs/VALIDATION.md` 记录精确运行命令、33 项定向 unittest、Headlines train/validation 搜索审计、没能执行的 pytest/Ruff 以及安全边界。全量 pytest 与 Ruff 当前仍受开发环境缺少工具限制；不能声明全量测试通过。
+- 本轮实现检查点与最初自动目录版本分别保留于 Git；没有提交真实 `.env`、课程任务目录或 API key，也没有调用真实学校 API。
+
+本文第 14 节的 T01–T18 是需求验收矩阵，不代表逐项 pytest 全绿。当前有限注册方案旨在支持同一通用流程与可追溯改进，不保证所有未知任务格式或分布都能获得高分；新数据格式应扩展通用发现/读取器，不加 task-name 专用算法分支。

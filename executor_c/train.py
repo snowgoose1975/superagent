@@ -167,8 +167,12 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
         model = _construct_model(plan, manifest)
         if manifest.get("representation") == "raw_text":
             modality = manifest["modality"]
-            X_train = combine_text_columns(data.X_train, modality["text_columns"])
-            X_valid = combine_text_columns(data.X_valid, modality["text_columns"])
+            field_mode = plan["pipeline"]["text_vectorizer"]["params"]["field_mode"]
+            if field_mode == "separate":
+                X_train, X_valid = data.X_train, data.X_valid
+            else:
+                X_train = combine_text_columns(data.X_train, modality["text_columns"])
+                X_valid = combine_text_columns(data.X_valid, modality["text_columns"])
         else:
             X_train, X_valid = data.X_train, data.X_valid
         print(f"模型：{plan['model']}", flush=True)

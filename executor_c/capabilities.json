@@ -1,6 +1,6 @@
 {
   "schema_version": "2.0",
-  "registry_version": "1.0",
+  "registry_version": "1.1",
   "problem_type": "classification",
   "models": {
     "random_forest": {
@@ -237,6 +237,78 @@
         }
       ]
     },
+    "multinomial_nb": {
+      "builder_id": "multinomial_nb",
+      "parameters": {
+        "alpha": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "exclusive_minimum": true
+        }
+      },
+      "representations": [
+        "raw_text"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "fit_prior": true
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {
+          "alpha": 0.1
+        },
+        {
+          "alpha": 1.0
+        },
+        {
+          "alpha": 10.0
+        }
+      ]
+    },
+    "complement_nb": {
+      "builder_id": "complement_nb",
+      "parameters": {
+        "alpha": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "exclusive_minimum": true
+        }
+      },
+      "representations": [
+        "raw_text"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "fit_prior": true
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {
+          "alpha": 0.1
+        },
+        {
+          "alpha": 1.0
+        },
+        {
+          "alpha": 10.0
+        }
+      ]
+    },
     "extra_trees": {
       "builder_id": "extra_trees",
       "parameters": {
@@ -423,7 +495,40 @@
     },
     "text_vectorizer": {
       "tfidf": {
+        "candidate_strategies": [
+          {
+            "field_mode": "shared",
+            "analyzer": "word",
+            "ngram_min": 1,
+            "ngram_max": 1
+          },
+          {
+            "field_mode": "separate",
+            "analyzer": "word",
+            "ngram_min": 1,
+            "ngram_max": 1
+          },
+          {
+            "field_mode": "shared",
+            "analyzer": "char",
+            "ngram_min": 2,
+            "ngram_max": 5
+          },
+          {
+            "field_mode": "separate",
+            "analyzer": "char",
+            "ngram_min": 2,
+            "ngram_max": 5
+          }
+        ],
         "parameters": {
+          "field_mode": {
+            "type": "enum",
+            "choices": [
+              "shared",
+              "separate"
+            ]
+          },
           "analyzer": {
             "type": "enum",
             "choices": [

@@ -38,6 +38,14 @@ def _classifier(model_id: str, params: dict[str, Any], seed: int) -> Any:
             solver=fixed["solver"],
             random_state=seed,
         )
+    if model_id == "multinomial_nb":
+        from sklearn.naive_bayes import MultinomialNB
+
+        return MultinomialNB(alpha=params["alpha"], fit_prior=fixed["fit_prior"])
+    if model_id == "complement_nb":
+        from sklearn.naive_bayes import ComplementNB
+
+        return ComplementNB(alpha=params["alpha"], fit_prior=fixed["fit_prior"])
     if model_id == "hist_gradient_boosting":
         from sklearn.ensemble import HistGradientBoostingClassifier
 
@@ -78,20 +86,28 @@ def build_estimator(
 
     steps: list[tuple[str, Any]] = []
     if representation == "raw_text":
+        from sklearn.compose import ColumnTransformer
         from sklearn.feature_extraction.text import TfidfVectorizer
 
         vectorizer = pipeline_spec["text_vectorizer"]["params"]
-        steps.append(
-            (
-                "text_vectorizer",
-                TfidfVectorizer(
-                    analyzer=vectorizer["analyzer"],
-                    ngram_range=(vectorizer["ngram_min"], vectorizer["ngram_max"]),
-                    max_features=vectorizer["max_features"],
-                    min_df=vectorizer["min_df"],
-                ),
+        vectorizer_kwargs = {
+            "analyzer": vectorizer["analyzer"],
+            "ngram_range": (vectorizer["ngram_min"], vectorizer["ngram_max"]),
+            "max_features": vectorizer["max_features"],
+            "min_df": vectorizer["min_df"],
+        }
+        if vectorizer["field_mode"] == "separate":
+            if not isinstance(modality, dict) or not isinstance(modality.get("text_columns"), list):
+                raise ValueError("separate text vectorization requires text column declarations")
+            transformers = [
+                (f"text_{index}", TfidfVectorizer(**vectorizer_kwargs), index)
+                for index, _ in enumerate(modality["text_columns"])
+            ]
+            steps.append(
+                ("text_vectorizer", ColumnTransformer(transformers, remainder="drop"))
             )
-        )
+        else:
+            steps.append(("text_vectorizer", TfidfVectorizer(**vectorizer_kwargs)))
     elif representation == "image_tensor":
         if not isinstance(modality, dict) or set(modality) != {
             "kind", "image_shape", "channel_layout", "value_range"

@@ -16,7 +16,7 @@ from typing import Any, Callable
 from agent_a.controller import PackageAController, SchoolAController
 from agent_a.search_config import load_search_config
 from data_b.prepare import prepare_data
-from evaluation_d.evaluate import evaluate
+from evaluation_d.evaluate import evaluate, evaluate_training_majority_baseline
 from evaluation_d.final_test import FinalTestError, evaluate_frozen_bundle, format_test_result
 from evaluation_d.school_gateway import GatewayError
 from evaluation_d.metric_contracts import metric_in_domain, validate_metric_spec
@@ -431,6 +431,7 @@ def run_project(
             "status": "not_requested"
             if test_config_path is None and task_directory is None else "not_run"
         },
+        "validation_baseline": None,
         "search_profile": search_profile,
         "search_config": search_config,
     }
@@ -482,6 +483,24 @@ def run_project(
         )
         training_profile = read_json(prepared["profile_path"])
         manifest = read_json(prepared["data_manifest_path"])
+        class_counts = list(training_profile.get("train_label_counts", {}).values())
+        positive_counts = [count for count in class_counts if type(count) is int and count > 0]
+        if len(positive_counts) != len(class_counts) or not positive_counts:
+            raise ValueError("B 训练画像缺少有效的训练类别计数")
+        training_profile["n_classes"] = len(class_counts)
+        training_profile["majority_share"] = max(class_counts) / sum(class_counts)
+        training_profile["class_imbalance_ratio"] = max(class_counts) / min(class_counts)
+        validation_baseline = evaluate_training_majority_baseline(
+            Path(prepared["evaluation_manifest_path"]),
+            training_profile.get("train_label_counts", {}),
+        )
+        summary["validation_baseline"] = validation_baseline
+        print(
+            f"[Baseline] validation {validation_baseline['metric']} = "
+            f"{validation_baseline['value']:.6f} "
+            f"(training-majority, class {validation_baseline['class_id']})",
+            flush=True,
+        )
         policy = spec["train_policy"]
         if planner is None:
             planner_kwargs = {
@@ -518,6 +537,7 @@ def run_project(
                 "training_profile": training_profile,
                 "task_context": task_context,
                 "primary_metric": spec["primary_metric"],
+                "validation_baseline": validation_baseline,
                 "data_overview": {
                     "n_train": training_profile["n_train"],
                     "n_features": manifest["n_features"],
@@ -596,6 +616,13 @@ def run_project(
                 spec=spec,
                 scorer=scorer,
             )
+            value = (entry.get("evaluation") or {}).get("value")
+            if type(value) in (int, float):
+                entry["baseline_delta"] = (
+                    value - validation_baseline["value"]
+                    if spec["primary_metric"]["greater_is_better"]
+                    else validation_baseline["value"] - value
+                )
             history.append(entry)
             _append_history(history_path, entry)
         else:
@@ -708,6 +735,13 @@ def run_project(
                         spec=spec,
                         scorer=scorer,
                     )
+                    value = (entry.get("evaluation") or {}).get("value")
+                    if type(value) in (int, float):
+                        entry["baseline_delta"] = (
+                            value - validation_baseline["value"]
+                            if spec["primary_metric"]["greater_is_better"]
+                            else validation_baseline["value"] - value
+                        )
                     history.append(entry)
                     _append_history(history_path, entry)
                     completed += 1
@@ -738,6 +772,22 @@ def run_project(
             print(
                 f"[Validation] {spec['primary_metric']['name']} = "
                 f"{best['evaluation']['value']:.6f}",
+                flush=True,
+            )
+            validation_gain = (
+                best["evaluation"]["value"] - validation_baseline["value"]
+                if spec["primary_metric"]["greater_is_better"]
+                else validation_baseline["value"] - best["evaluation"]["value"]
+            )
+            summary["validation_gain_over_baseline"] = validation_gain
+            summary["validation_quality"] = (
+                "above_training_majority_baseline"
+                if validation_gain > 0
+                else "at_or_below_training_majority_baseline"
+            )
+            print(
+                f"[质量] 相对训练多数类基线提升 {validation_gain:+.6f} "
+                f"({summary['validation_quality']})",
                 flush=True,
             )
             print(f"[工件] {bundle.relative_to(root).as_posix()}", flush=True)

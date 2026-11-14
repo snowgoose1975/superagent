@@ -1,4 +1,4 @@
-# SuperAgent H0–H9 实施与验证记录
+# SuperAgent H0–H10 实施与验证记录
 
 更新时间：2026-11-14（Asia/Shanghai）。验证范围是当前工作区的离线实现与合成数据，不代表学校 API 的真实端到端运行。
 
@@ -54,7 +54,22 @@
 - 优惠券 NPY 与 Headlines CTR CSV 两个实际任务仅做开发分区发现与内部 TaskSpec 校验；审计明确禁止打开 `test.csv` 和 `*_test.npy`。两者识别成功。优惠券自动预算匹配到原有 `course-project-2026`，没有创建新账本或修改旧账本。
 - A 的 10 个现有控制器断言函数通过直接合成执行复核（含新任务摘要有界与注入隔离断言）；这不是完整 pytest 运行。代码编译、3 个 CLI help、配置 JSON 和行尾空白扫描通过。
 
-本阶段未读取真实 `.env` 或 key、未调用学校 API、未重新评估真实 test。完整 pytest suite 和 Ruff 仍未运行；29 项新增 unittest 和上述离线验证不能替代这两项检查。
+本阶段未读取真实 `.env` 或 key、未调用学校 API、未重新评估真实 test。完整 pytest suite 和 Ruff 仍未运行；H9 的 29 项及 H10 的 33 项标准库 unittest 和上述离线验证不能替代这两项检查。
+
+## H10 通用配方搜索与 validation 基线
+
+- A 的 run 决策现在可携带白名单 `pipeline`；文本表示随模型/参数贯穿 Plan 2.0、C 训练、history、冻结的 `plan.json` 与独立 `predict_bundle()`。缺失新字段的旧文本计划默认按原共享词表处理。能力清单仍由唯一模型/表示注册表生成。
+- 多字段文本默认策略覆盖共享/逐字段独立词表、word unigram/character 2–5 gram，与 LogisticRegression、MultinomialNB、ComplementNB 组成 12 个起始配方。参数细化只在可用预算与实验轮数内继续；完整配方去重防止不同文本表示误认成重复试验。
+- B 的训练类别计数用于产生多数类预测基线；`log_loss` 额外使用训练先验概率。D 只在 validation labels 上评分；A 获得有限摘要与方向化 baseline 差值，不接触 labels 或 test。baseline 与 manifest 身份不匹配时拒绝评分。baseline 用于诊断，不硬编码任务专属的方案或成功阈值。
+- 自动任务 integration 新增 4 项通用配方用例，验证逐字段信号、12 种文本配方覆盖、LLM 通过不同 pipeline 区分同模型配置、validation baseline 和任务身份检查。连同 19 项 task-directory 测试，共 33 项定向 unittest 全部通过：
+
+```bash
+../.venv/bin/python -m unittest tests.test_task_run tests.test_task_directory -v
+```
+
+- 在 `Released_Task2-Headlines_CTR` 上执行了离线 train/validation 搜索审计，未启用 test config；Python 文件打开审计会阻止访问原始 `test.csv`。16 个试验成功，覆盖 12 个模型×文本表示组合后进行 LogisticRegression 参数细化；最佳 validation accuracy 为 `0.678723`，训练多数类 baseline 为 `0.511702`。这是开发分区搜索机制检查，不是 test 结果，也不能证明对其他任务的性能保证。产物位于 `/tmp/superagent-h10-headlines-output/`。
+- 额外运行 `unittest discover -s tests -v` 时，33 个定向用例通过；另 11 个 pytest 风格模块因环境缺少 `pytest` 而导入失败（`ModuleNotFoundError`），并非这些测试已通过。项目 `.venv` 同样没有 Ruff；因此完整 pytest 和 Ruff 仍待开发依赖可用的环境运行。没有安装测试工具或更改项目依赖。
+- 本阶段未读取真实 `.env`/API key、未调用学校 API、未打开 Headlines `test.csv`，也没有按该任务名称加入模型分支。仍支持任务受现有读入器与分类模态范围约束；通用支持范围不等于对所有未知文件格式或任务都保证高分。
 
 ## 预算价格和运行边界
 
