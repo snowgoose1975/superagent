@@ -68,6 +68,7 @@
 ```
 
 - 在 `Released_Task2-Headlines_CTR` 上执行了离线 train/validation 搜索审计，未启用 test config；Python 文件打开审计会阻止访问原始 `test.csv`。16 个试验成功，覆盖 12 个模型×文本表示组合后进行 LogisticRegression 参数细化；最佳 validation accuracy 为 `0.678723`，训练多数类 baseline 为 `0.511702`。这是开发分区搜索机制检查，不是 test 结果，也不能证明对其他任务的性能保证。产物位于 `/tmp/superagent-h10-headlines-output/`。
+- 用户询问通用文本改动是否影响 vehicle 表格任务后，又以当前离线规则规划器对 `in_vehicle_coupon_recommendation` 做 train/validation 回归审计；Python audit hook 拦截 `*_test.npy`/`test.csv` 打开，run 使用人工配置入口且不带 test config。自动识别为表格，4 个现有 dense 模型族都成功；16 轮按 patience 停止，validation accuracy `0.757635`，training-majority baseline `0.568473`，summary 的 `test_evaluation.status` 为 `not_requested`。这说明 dense 路由可用，不是与旧 school-LLM 决策的严格 A/B，也不能推断最终 test 或保证学校 LLM 轨迹相同。产物位于 `/tmp/superagent-h10-vehicle-output/`。
 - 额外运行 `unittest discover -s tests -v` 时，33 个定向用例通过；另 11 个 pytest 风格模块因环境缺少 `pytest` 而导入失败（`ModuleNotFoundError`），并非这些测试已通过。项目 `.venv` 同样没有 Ruff；因此完整 pytest 和 Ruff 仍待开发依赖可用的环境运行。没有安装测试工具或更改项目依赖。
 - 本阶段未读取真实 `.env`/API key、未调用学校 API、未打开 Headlines `test.csv`，也没有按该任务名称加入模型分支。仍支持任务受现有读入器与分类模态范围约束；通用支持范围不等于对所有未知文件格式或任务都保证高分。
 
