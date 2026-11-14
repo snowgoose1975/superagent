@@ -4,7 +4,7 @@
 
 ```bash
 no_proxy=aigc-api.hkust-gz.edu.cn \
-../.venv/bin/python main.py run \
+.venv/bin/python main.py run \
   --task ../task/in_vehicle_coupon_recommendation \
   --planner school
 ```
@@ -19,7 +19,15 @@ Table tasks keep TaskSpec 1.0. Bounded text and image-array classification use T
 
 ## 先运行离线模式
 
-在 VS Code 使用 **File → Open Folder** 打开 `artifacts/superagent-team-v2/`。在该目录的 Windows PowerShell 终端中执行：
+Linux/WSL 克隆项目后，在项目目录创建独立环境并安装依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python main.py run --task ../task/<任务目录>
+```
+
+在 VS Code 使用 **File → Open Folder** 打开 `git clone` 生成的项目目录。在该目录的 Windows PowerShell 终端中执行：
 
 ```powershell
 py -3.12 -m venv .venv
@@ -45,7 +53,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe main.py run --config configs/coupon.json --planner school --llm-config configs/school-api.json --llm-max-calls 1 --llm-budget-rmb 0.10
 ```
 
-school 模式从项目根目录 `.env` 读取 `SCHOOL_API_KEY`。先复制根目录 `.env.example` 为 `.env`，再在 `.env` 中填写 `SCHOOL_API_KEY=实际key`。`.env` 不进入版本控制或交付包。`configs/school-api.json` 保存服务 URL、模型和开发单价，不含 key；价格只是开发估算依据，尚未核验为课程正式价格。
+school 模式从项目根目录 `.env` 读取 `SCHOOL_API_KEY`。Linux/WSL 可运行 `cp .env.example .env`；Windows PowerShell 可运行 `Copy-Item .env.example .env`。然后在 `.env` 中填写自己获准使用的 `SCHOOL_API_KEY`。不要共享真实 `.env` 或 API key；`.env` 不进入版本控制或交付包。`configs/school-api.json` 保存服务 URL、模型和开发单价，不含 key；价格只是开发估算依据，尚未核验为课程正式价格。
 
 上述兼容配置命令最多发出一次真实模型请求；本文开头的自动 `--task` 命令默认最多 20 次调用。合规方案触发真实训练和评分。若请求超时、HTTP 失败或供应商 usage 缺失，调用用量记为未知并立即停止，不重试、不回退离线规划继续运行。只有 usage 已知而模型回复内容不合规时，才允许记录后使用规则规划器处理当前决策。summary 会写明规划模式、最后决策来源和真实调用次数。
 
@@ -67,7 +75,7 @@ school 模式从项目根目录 `.env` 读取 `SCHOOL_API_KEY`。先复制根目
 
 ```bash
 no_proxy=aigc-api.hkust-gz.edu.cn \
-../.venv/bin/python main.py run \
+.venv/bin/python main.py run \
   --task ../task/in_vehicle_coupon_recommendation \
   --planner school \
   --llm-config configs/school-api.json \
