@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "require_family_coverage": true,
+  "min_exploration_trials": 8,
+  "patience": 8,
+  "min_delta": 0.0,
+  "max_consecutive_failures": 3,
+  "max_session_seconds": 1800,
+  "finalize_reserve_seconds": 60,
+  "confirmation_seed_offsets": []
+}

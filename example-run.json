@@ -1,0 +1,49 @@
+{
+  "mode": "offline_rules",
+  "strategy_source": "同学A：a-agent-v1/rule_based_hill_climb_v1",
+  "real_llm_calls": 0,
+  "task_id": "in_vehicle_coupon_recommendation",
+  "session_id": "session_20261112T145948Z_d83ebc17",
+  "summary_path": "sessions/session_20261112T145948Z_d83ebc17/summary.json",
+  "history_path": "sessions/session_20261112T145948Z_d83ebc17/history.jsonl",
+  "bundle_path": "submission/in_vehicle_coupon_recommendation/final_d83ebc17/bundle.json",
+  "trials": [
+    {
+      "experiment_id": "exp_d83ebc17_001",
+      "model": "random_forest",
+      "params": {
+        "n_estimators": 100,
+        "max_depth": null,
+        "min_samples_leaf": 1
+      },
+      "validation_accuracy": 0.7408866995073892,
+      "result_path": "runs/in_vehicle_coupon_recommendation/teacher_v1/exp_d83ebc17_001/result.json"
+    },
+    {
+      "experiment_id": "exp_d83ebc17_002",
+      "model": "logistic_regression",
+      "params": {
+        "C": 1.0,
+        "max_iter": 1000
+      },
+      "validation_accuracy": 0.6630541871921182,
+      "result_path": "runs/in_vehicle_coupon_recommendation/teacher_v1/exp_d83ebc17_002/result.json"
+    },
+    {
+      "experiment_id": "exp_d83ebc17_003",
+      "model": "random_forest",
+      "params": {
+        "n_estimators": 100,
+        "max_depth": 10,
+        "min_samples_leaf": 1
+      },
+      "validation_accuracy": 0.7167487684729064,
+      "result_path": "runs/in_vehicle_coupon_recommendation/teacher_v1/exp_d83ebc17_003/result.json"
+    }
+  ],
+  "n_train": 8117,
+  "n_validation": 2030,
+  "n_encoded_features": 111,
+  "teacher_test_read": false,
+  "fresh_process_prediction_max_abs_difference": 0.0
+}

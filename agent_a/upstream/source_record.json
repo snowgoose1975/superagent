@@ -1,0 +1,19 @@
+{
+  "archive": "a-agent-v1(1).zip",
+  "archive_sha256": "29d8154b29556fcec1f0b7618a51b29f035fe3af3f3166d4e089551b4bc5ce1c",
+  "source_prefix": "superagent-a/agent/",
+  "selected_files": {
+    "planner.py": "77676133286b9a88f935efafd30e125dfeed0765cd7fc957e59d56ba05ce2508",
+    "decide.py": "e31997573a6e27b7077a9876afe3043faf93be28676952df74df07bb9b8ba94d",
+    "llm_planner.py": "f3daa110da09f36e748e4a6c1f7d90481153f263e2bb6a6d943ee93ccdb04e29"
+  },
+  "integration_changes": [
+    "Copied planner.py, decide.py, and llm_planner.py from the archive; source-file hashes above identify the originals.",
+    "Added an adapter in controller.py for task identity, normalized history, B profile, main-owned IDs/seeds/timeouts, and C parameter validation.",
+    "Offline rule decisions pass a null remaining budget; vendored decide.py was adapted to permit null only for explicit offline_rules mode.",
+    "Vendored llm_planner.py includes B training profile and C capabilities in its JSON context; the event sink discards event details so prompt/reply bodies are not logged.",
+    "School mode injects the shared gateway, validates complete supplier usage, propagates gateway exceptions directly from LLMPlanner.next_plan(), and records only whether the LLM or rule fallback supplied the decision.",
+    "The gateway owns supplier usage and reserved/unknown ledger records; LLMPlanner is constructed without its legacy BudgetTracker.",
+    "Did not import upstream run.py, task_adapter.py, evaluate.py, budget.py, or package entry points."
+  ]
+}

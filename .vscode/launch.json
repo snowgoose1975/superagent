@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "阅读主流程：优惠券任务（离线 A）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["run", "--config", "${workspaceFolder}/configs/coupon.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": true
+    },
+    {
+      "name": "学校 API：读取根 .env，最多规划一次",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["run", "--config", "${workspaceFolder}/configs/coupon.json", "--planner", "school", "--llm-config", "${workspaceFolder}/configs/school-api.json", "--llm-max-calls", "1", "--llm-budget-rmb", "0.10"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": true
+    }
+  ]
+}

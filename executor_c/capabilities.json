@@ -1,0 +1,467 @@
+{
+  "schema_version": "2.0",
+  "registry_version": "1.0",
+  "problem_type": "classification",
+  "models": {
+    "random_forest": {
+      "builder_id": "random_forest",
+      "parameters": {
+        "n_estimators": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": null,
+          "minimum": 1,
+          "maximum": 50,
+          "nullable": true
+        },
+        "min_samples_leaf": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "min_samples_split": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 2,
+          "maximum": 100
+        },
+        "max_features": {
+          "type": "ratio_or_feature_token",
+          "default": "sqrt",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "choices": [
+            "sqrt",
+            "log2",
+            null
+          ],
+          "exclusive_minimum": true
+        },
+        "criterion": {
+          "type": "enum",
+          "default": "gini",
+          "choices": [
+            "gini",
+            "entropy"
+          ]
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "dense_numeric",
+        "image_tensor"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "bootstrap": true,
+        "n_jobs": 1
+      },
+      "profiles": [
+        "legacy",
+        "expanded"
+      ],
+      "legacy_candidates": [
+        {
+          "n_estimators": 100,
+          "max_depth": null,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 10,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 20,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 30,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 10,
+          "min_samples_leaf": 5
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 20,
+          "min_samples_leaf": 5
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 30,
+          "min_samples_leaf": 5
+        },
+        {
+          "n_estimators": 200,
+          "max_depth": null,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 200,
+          "max_depth": 20,
+          "min_samples_leaf": 5
+        },
+        {
+          "n_estimators": 300,
+          "max_depth": 30,
+          "min_samples_leaf": 1
+        }
+      ],
+      "candidates": [
+        {
+          "n_estimators": 100,
+          "max_depth": null,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 100,
+          "max_depth": 10,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 200,
+          "max_depth": null,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 400,
+          "max_depth": 16,
+          "min_samples_leaf": 2
+        }
+      ]
+    },
+    "logistic_regression": {
+      "builder_id": "logistic_regression",
+      "parameters": {
+        "C": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 100.0,
+          "exclusive_minimum": true
+        },
+        "max_iter": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 1,
+          "maximum": 2000
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "dense_numeric",
+        "raw_text",
+        "image_tensor"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "solver": "lbfgs",
+        "scaler": "StandardScaler",
+        "n_jobs": 1
+      },
+      "profiles": [
+        "legacy",
+        "expanded"
+      ],
+      "legacy_candidates": [
+        {
+          "C": 1.0,
+          "max_iter": 1000
+        },
+        {
+          "C": 0.1,
+          "max_iter": 1000
+        },
+        {
+          "C": 10.0,
+          "max_iter": 1000
+        },
+        {
+          "C": 0.3,
+          "max_iter": 1500
+        },
+        {
+          "C": 3.0,
+          "max_iter": 1500
+        }
+      ],
+      "candidates": [
+        {
+          "C": 1.0,
+          "max_iter": 1000
+        },
+        {
+          "C": 0.1,
+          "max_iter": 1000
+        },
+        {
+          "C": 10.0,
+          "max_iter": 1000
+        },
+        {
+          "C": 0.3,
+          "max_iter": 1500
+        },
+        {
+          "C": 3.0,
+          "max_iter": 1500
+        }
+      ]
+    },
+    "extra_trees": {
+      "builder_id": "extra_trees",
+      "parameters": {
+        "n_estimators": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": null,
+          "minimum": 1,
+          "maximum": 50,
+          "nullable": true
+        },
+        "min_samples_leaf": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "min_samples_split": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 2,
+          "maximum": 100
+        },
+        "max_features": {
+          "type": "ratio_or_feature_token",
+          "default": "sqrt",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "choices": [
+            "sqrt",
+            "log2",
+            null
+          ],
+          "exclusive_minimum": true
+        },
+        "criterion": {
+          "type": "enum",
+          "default": "gini",
+          "choices": [
+            "gini",
+            "entropy"
+          ]
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "dense_numeric",
+        "image_tensor"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "bootstrap": false,
+        "n_jobs": 1
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {
+          "n_estimators": 100,
+          "max_depth": null,
+          "min_samples_leaf": 1
+        },
+        {
+          "n_estimators": 200,
+          "max_depth": 16,
+          "min_samples_leaf": 2
+        },
+        {
+          "n_estimators": 400,
+          "max_depth": 16,
+          "min_samples_leaf": 2
+        }
+      ]
+    },
+    "hist_gradient_boosting": {
+      "builder_id": "hist_gradient_boosting",
+      "parameters": {
+        "learning_rate": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0.001,
+          "maximum": 1.0
+        },
+        "max_iter": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500
+        },
+        "max_leaf_nodes": {
+          "type": "integer",
+          "default": 31,
+          "minimum": 2,
+          "maximum": 127
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": null,
+          "minimum": 1,
+          "maximum": 50,
+          "nullable": true
+        },
+        "min_samples_leaf": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "l2_regularization": {
+          "type": "number",
+          "default": 0.0,
+          "minimum": 0.0,
+          "maximum": 100.0
+        }
+      },
+      "representations": [
+        "dense_numeric",
+        "image_tensor"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "categorical_features": null,
+        "early_stopping": false
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {
+          "learning_rate": 0.1,
+          "max_iter": 100,
+          "max_leaf_nodes": 31
+        },
+        {
+          "learning_rate": 0.03,
+          "max_iter": 200,
+          "max_leaf_nodes": 31
+        },
+        {
+          "learning_rate": 0.1,
+          "max_iter": 200,
+          "max_leaf_nodes": 15
+        },
+        {
+          "learning_rate": 0.2,
+          "max_iter": 400,
+          "max_leaf_nodes": 31
+        }
+      ]
+    }
+  },
+  "pipeline_components": {
+    "feature_selector": {
+      "none": {},
+      "variance_threshold": {
+        "parameters": {
+          "threshold": {
+            "type": "number",
+            "default": 0.0,
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        }
+      }
+    },
+    "text_vectorizer": {
+      "tfidf": {
+        "parameters": {
+          "analyzer": {
+            "type": "enum",
+            "choices": [
+              "word",
+              "char"
+            ]
+          },
+          "ngram_min": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5
+          },
+          "ngram_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5
+          },
+          "max_features": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 100000
+          },
+          "min_df": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          }
+        }
+      }
+    },
+    "image_transform": {
+      "flatten_scale": {}
+    }
+  },
+  "max_timeout_seconds": 600,
+  "representations": [
+    "dense_numeric",
+    "raw_text",
+    "image_tensor"
+  ]
+}

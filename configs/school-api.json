@@ -1,0 +1,9 @@
+{
+  "url": "https://aigc-api.hkust-gz.edu.cn/api/v2/chat/completions",
+  "model": "DeepSeek-V4.1-Flash",
+  "input_cny_per_million": "0.50",
+  "output_cny_per_million": "2.00",
+  "max_tokens": 1024,
+  "max_input_tokens": 16384,
+  "timeout": 90
+}
