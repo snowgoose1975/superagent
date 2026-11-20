@@ -37,6 +37,14 @@ def _csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
 
 
 class TaskDirectoryTests(unittest.TestCase):
+    def _symlink(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows 未授予符号链接权限；不修改系统设置")
+            raise
+
     def setUp(self) -> None:
         self.area = PROJECT_ROOT / ".cache" / "test-temp" / f"task-directory-{uuid.uuid4().hex}"
         self.area.mkdir(parents=True)
@@ -256,7 +264,7 @@ class TaskDirectoryTests(unittest.TestCase):
 
     def test_input_symlink_cannot_escape_task_root(self) -> None:
         _array(self.area / "outside.npy", np.arange(24).reshape(12, 2))
-        (self.source / "N_train.npy").symlink_to(self.area / "outside.npy")
+        self._symlink(self.source / "N_train.npy", self.area / "outside.npy")
         for name in ("N_val.npy", "N_test.npy", "y_train.npy", "y_val.npy", "y_test.npy"):
             (self.source / name).write_bytes(b"unread")
         with self.assertRaisesRegex(TaskDirectoryError, "越出任务目录"):
@@ -270,7 +278,7 @@ class TaskDirectoryTests(unittest.TestCase):
         # Repoint the deliberately unread placeholder without deleting history.
         original = self.source / "N_test.npy"
         original.rename(self.source / "N_test.original")
-        original.symlink_to(outside)
+        self._symlink(original, outside)
         with self.assertRaisesRegex(TaskDirectoryError, "越出任务目录"):
             materialize_final_test(result["test_descriptor_path"], self.area / "test_input")
 

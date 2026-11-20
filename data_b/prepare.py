@@ -13,8 +13,10 @@ import joblib
 import numpy as np
 
 from .npy_reader import read_npy_array
-from .preprocessing import TablePreprocessor
+from .preprocessing import TablePreprocessor, validate_preprocessing
+from .profiling import table_profile
 from .raw_reader import load_feature_frame, typed_category_token
+from .sample_index import load_sample_index, save_combined_index
 from evaluation_d.metric_contracts import validate_metric_spec
 
 _TASK_FIELDS = {
@@ -43,6 +45,7 @@ _ARTIFACTS = (
     "label_mapping.json",
     "evaluation_manifest.json",
     "metadata/profile.json",
+    "metadata/sample_index.csv",
     "data_manifest.json",
 )
 
@@ -90,7 +93,7 @@ def _source_file(root: Path, value: Any) -> tuple[Path, str]:
 
 
 def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str, str]]:
-    if not isinstance(task_spec, dict) or set(task_spec) != _TASK_FIELDS:
+    if not isinstance(task_spec, dict) or not _TASK_FIELDS <= set(task_spec) <= _TASK_FIELDS | {"preprocessing"}:
         extra = sorted(set(task_spec) - _TASK_FIELDS) if isinstance(task_spec, dict) else []
         missing = (
             sorted(_TASK_FIELDS - set(task_spec))
@@ -116,8 +119,9 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
     kinds = task_spec["feature_types"]
     if not isinstance(kinds, dict) or set(kinds) != set(columns):
         raise ValueError("feature_types 必须且只能覆盖 feature_columns")
-    if any(kind not in {"categorical", "numeric"} for kind in kinds.values()):
-        raise ValueError("feature_types 仅支持 categorical 或 numeric")
+    if any(kind not in {"categorical", "numeric", "text"} for kind in kinds.values()):
+        raise ValueError("feature_types 仅支持 categorical、numeric 或 text")
+    validate_preprocessing(task_spec.get("preprocessing"), kinds)
     validate_metric_spec(task_spec["primary_metric"])
     policy = task_spec["train_policy"]
     if not isinstance(policy, dict) or set(policy) != {
@@ -136,8 +140,8 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
     if not isinstance(partitions, dict) or set(partitions) != _PARTITIONS:
         raise ValueError("partitions 必须且只能包含 train 与 validation；禁止 test 字段")
     for name, part in partitions.items():
-        if not isinstance(part, dict) or set(part) != _SPLIT_FIELDS:
-            raise ValueError(f"{name} 分区字段必须是 features_path/labels_path/n_samples")
+        if not isinstance(part, dict) or not _SPLIT_FIELDS <= set(part) <= _SPLIT_FIELDS | {"sample_ids_path"}:
+            raise ValueError(f"{name} 分区需要 features_path/labels_path/n_samples，可选 sample_ids_path")
         if type(part["n_samples"]) is not int or part["n_samples"] < 1:
             raise ValueError(f"{name}.n_samples 必须为正整数")
     values, names = task_spec["label_values"], task_spec["label_names"]
@@ -178,7 +182,10 @@ def _load_partition(
         "features": {"relative_path": feature_relative, "sha256": feature_hash_after},
         "labels": {"relative_path": label_relative, "sha256": label_hash_after},
     }
-    return frame, labels, hashes
+    sample_rows, sample_hash = load_sample_index(root, part, name)
+    hashes.update(sample_hash)
+    frame.index = [row["sample_id"] for row in sample_rows]
+    return frame, labels, hashes, sample_rows
 
 
 def _label_token(value: Any) -> str:
@@ -201,11 +208,13 @@ def _source_signature(
         "label_values": [_label_token(v) for v in spec["label_values"]],
         "label_names": spec["label_names"],
         "primary_metric": spec["primary_metric"],
+        "preprocessing": spec.get("preprocessing", {}),
         "n_samples": {name: spec["partitions"][name]["n_samples"] for name in sorted(_PARTITIONS)},
         "partitions": hashes,
         "preparation_code_sha256": {
             name: _sha256(Path(__file__).with_name(name))
-            for name in ("prepare.py", "raw_reader.py", "preprocessing.py", "npy_reader.py")
+            for name in ("prepare.py", "raw_reader.py", "preprocessing.py", "npy_reader.py",
+                         "profiling.py", "sample_index.py")
         },
     }
     semantic = hashlib.sha256(_json_bytes(schema)).hexdigest()
@@ -243,6 +252,7 @@ def _read_cache(directory: Path, signature: str) -> dict[str, Any] | None:
             "profile_path": str((directory / "metadata" / "profile.json").resolve()),
             "preprocessor_path": str((directory / "preprocessor.joblib").resolve()),
             "label_mapping_path": str((directory / "label_mapping.json").resolve()),
+            "sample_index_path": str((directory / "metadata" / "sample_index.csv").resolve()),
         }
     )
     result["reused"] = True
@@ -276,10 +286,10 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
         if not directory.exists():
             directory.mkdir(parents=True, exist_ok=False)
             fresh_directory = directory
-        train_frame, train_raw_labels, train_hashes = _load_partition(
+        train_frame, train_raw_labels, train_hashes, train_index = _load_partition(
             source_root, "train", task_spec, columns, kinds
         )
-        valid_frame, valid_raw_labels, valid_hashes = _load_partition(
+        valid_frame, valid_raw_labels, valid_hashes, valid_index = _load_partition(
             source_root, "validation", task_spec, columns, kinds
         )
         if train_frame.shape[1] != valid_frame.shape[1]:
@@ -311,7 +321,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
         metadata = directory / "metadata"
         metadata.mkdir()
         try:
-            preprocessor = TablePreprocessor(kinds)
+            preprocessor = TablePreprocessor(kinds, options=task_spec.get("preprocessing"))
             X_train = preprocessor.fit_transform(train_frame)
             X_valid = preprocessor.transform(valid_frame)
             if X_train.shape[1] < 1:
@@ -330,12 +340,15 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
                 "feature_columns": columns,
                 "feature_types": {c: kinds[c] for c in columns},
                 "train_label_counts": train_counts,
+                "preprocessing": task_spec.get("preprocessing", {}),
+                **table_profile(train_frame, kinds),
             }
             _write_json(metadata / "profile.json", profile)
+            save_combined_index(metadata / "sample_index.csv", train_index, valid_index)
             _save_array(directory / "X_train.npy", X_train)
             _save_array(directory / "y_train.npy", y_train)
             _save_array(directory / "X_valid.npy", X_valid)
-            valid_ids = [f"validation_{index:09d}" for index in range(len(X_valid))]
+            valid_ids = [row["sample_id"] for row in valid_index]
             _save_ids(directory / "valid_ids.csv", valid_ids)
             _save_ids(directory / "validation_labels.csv", valid_ids, y_valid.tolist())
             with (directory / "preprocessor.joblib").open("xb") as stream:
@@ -399,6 +412,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
                 "profile_path": str((metadata / "profile.json").resolve()),
                 "preprocessor_path": str((directory / "preprocessor.joblib").resolve()),
                 "label_mapping_path": str((directory / "label_mapping.json").resolve()),
+                "sample_index_path": str((metadata / "sample_index.csv").resolve()),
                 "source_signature": signature,
                 "source_file_sha256": hashes,
                 "artifact_sha256": file_hashes,

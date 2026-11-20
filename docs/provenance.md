@@ -27,4 +27,8 @@ v2 是独立整合副本。v1 与前轮交付保留原样；本目录不复制�
 
 ## 声明
 
+2026-11-20 增量：`data_b/llm_analysis.py`、可选预处理配置、CLI 早期网关接线及 `test_b_llm.py` 由 Codex 辅助实现，复用现有 D 网关与 sklearn 组件，没有复制外部 Agent 框架。真实模型调用未由自动验证执行；测试均为合成数据与 mock transport。
+
+2026-11-14 B 第一轮增量：在现有集成代码上增加可选样本来源索引、无 test 开发模式、混合表格的有界 TF-IDF 分支和训练画像；相应适配 A 上游 `_compact_profile` 以接收有界统计，不替换其规划或调用网关。实现由 Codex 辅助编写，未复制额外第三方 Agent 代码；范围与验证见 `b-improvements.md`。
+
 这是课程项目的集成实现，不表示课程已认可某个完整 Agent 底座。任务预算 profile 是可追溯的公开参考价换算，不是学校端正式账单核验。自动验证使用 mock，不代表发生过真实学校 API 请求。v2 的验证范围和当前限制见 [`VALIDATION.md`](VALIDATION.md)。
