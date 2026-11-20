@@ -60,7 +60,7 @@ def load_task_spec(config_path: str | Path) -> dict[str, Any]:
     path = Path(config_path).resolve()
     spec = read_json(path, error_code="PLAN_INVALID")
     if spec.get("schema_version") == "1.0":
-        if set(spec) != TASK_FIELDS:
+        if not TASK_FIELDS <= set(spec) <= TASK_FIELDS | {"preprocessing"}:
             raise ValueError("TaskSpec 1.0 字段不符合表格任务约定")
     elif spec.get("schema_version") == "2.0":
         if set(spec) != TASK_FIELDS_V2:
@@ -367,10 +367,18 @@ def run_project(
     task_directory: str | Path | None = None,
     gateway_factory: Callable[[dict[str, Any], Path], Any] | None = None,
     max_trials: int = 20,
+    b_analysis: str = "rules",
+    task_documents: list[str] | None = None,
 ) -> Path:
     """从任务目录自动接入或读取开发配置；冻结 validation 最优方案后评估 test。"""
     if planner_mode not in {"offline", "school"}:
         raise ValueError("planner_mode 必须是 offline 或 school")
+    if b_analysis not in {"rules", "llm"}:
+        raise ValueError("b_analysis 必须为 rules 或 llm")
+    if b_analysis == "llm" and (task_directory is None or planner_mode != "school"):
+        raise ValueError("B LLM 分析需要 --task 与 --planner school，共用 D 网关")
+    if task_documents is not None and b_analysis != "llm":
+        raise ValueError("--task-doc 仅用于 B LLM 分析")
     if task_directory is not None and (config_path is not None or test_config_path is not None):
         raise ValueError("--task 自动接入不接受人工 --config/--test-config")
     if gateway is not None and gateway_factory is not None:
@@ -434,6 +442,7 @@ def run_project(
         "validation_baseline": None,
         "search_profile": search_profile,
         "search_config": search_config,
+        "b_analysis": b_analysis,
     }
     prepared: dict[str, Any] | None = None
     task_context: dict[str, Any] = {}
@@ -443,11 +452,32 @@ def run_project(
             from data_b.task_directory import discover_task_directory
 
             print(f"[任务] 自动读取任务说明和开发数据：{Path(task_directory).resolve()}", flush=True)
+            resolution = None
+            if b_analysis == "llm":
+                from data_b.llm_analysis import resolve_layout
+                if gateway is None:
+                    gateway = gateway_factory(None, session_dir)
+                if not isinstance(gateway.metadata().get("task_budget"), dict):
+                    raise ValueError("B LLM 分析需要 D 的持久任务预算账本")
+                resolution = resolve_layout(task_directory, gateway, session_dir / "b_analysis", task_documents)
             discovered = discover_task_directory(
-                Path(task_directory), session_dir / "task_input", max_trials=max_trials
+                Path(task_directory), session_dir / "task_input", max_trials=max_trials,
+                resolution=resolution,
             )
             spec = discovered["task_spec"]
+            if b_analysis == "llm":
+                from data_b.llm_analysis import review_quality
+                expected_budget = _automatic_budget_id(root, discovered["discovery_report"])
+                current_budget = gateway.metadata()["task_budget"]["budget_id"]
+                if (root / "sessions" / "task-budgets" / f"{expected_budget}.json").is_file() and current_budget != expected_budget:
+                    raise ValueError("同训练输入已有其他预算账本；停止，解析调用费用保留在本次指定账本")
+                spec, quality = review_quality(spec, gateway, session_dir / "b_analysis", resolution["documents"])
+                discovered["discovery_report"]["data_version"] = spec["data_version"]
+                summary["b_quality_report"] = (session_dir / "b_analysis" / "quality.json").relative_to(root).as_posix()
+                summary["b_quality_findings"] = quality["findings"]
             test_config_path = discovered["test_descriptor_path"]
+            if test_config_path is None:
+                summary["test_evaluation"] = {"status": "not_requested"}
             task_context = discovered["task_context"]
             write_json(session_dir / "task.discovery.json", discovered["discovery_report"])
             write_json(session_dir / "task_context.json", task_context)
@@ -455,17 +485,19 @@ def run_project(
                 task_id=spec["task_id"],
                 data_version=spec["data_version"],
                 discovery_path=(session_dir / "task.discovery.json").relative_to(root).as_posix(),
-                test_descriptor_path=Path(test_config_path).relative_to(root).as_posix(),
+                test_descriptor_path=(Path(test_config_path).relative_to(root).as_posix()
+                                      if test_config_path is not None else None),
             )
             kind = spec.get("modality", {}).get("kind", "tabular")
             print(
                 f"[任务] 已识别 {kind} 分类，指标 {spec['primary_metric']['name']}；"
-                "自动生成内部任务契约，test 将在冻结后读取。",
+                + ("自动生成内部任务契约，test 将在冻结后读取。" if test_config_path is not None
+                   else "自动生成内部任务契约；未提供 test，本次仅进行开发与冻结。"),
                 flush=True,
             )
         write_json(session_dir / "task.snapshot.json", spec)
         spec = load_task_spec(session_dir / "task.snapshot.json")
-        if gateway_factory is not None:
+        if gateway_factory is not None and gateway is None:
             stage = "gateway_init"
             gateway = gateway_factory(spec, session_dir)
         stage = "preparation"
@@ -910,6 +942,8 @@ def main(argv: list[str] | None = None) -> int:
     task_input.add_argument("--config", type=Path, help="开发兼容入口：使用人工 TaskSpec")
     run_parser.add_argument("--output-root", type=Path)
     run_parser.add_argument("--planner", choices=("offline", "school"), default="offline")
+    run_parser.add_argument("--b-analysis", choices=("rules", "llm"), default="rules")
+    run_parser.add_argument("--task-doc", action="append", help="任务目录内说明文件相对路径，可重复；TXT/JSON 显式指定")
     run_parser.add_argument(
         "--llm-config", type=Path, default=PROJECT_ROOT / "configs" / "school-api.json"
     )
@@ -969,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.task is not None and args.test_config is not None:
             raise ValueError("--task 自动发现最终 test，无需 --test-config")
         automatic = args.task is not None
+        if args.b_analysis == "llm" and (not automatic or args.planner != "school" or not args.task_budget_id):
+            raise ValueError("--b-analysis llm 需要 --task、--planner school 和稳定的 --task-budget-id（解析前记账）")
         billing_profile = args.billing_profile
         if automatic and args.planner == "school":
             billing_profile = billing_profile or "deepseek-v4.1-flash-peak-2026-10-21"
@@ -985,9 +1021,9 @@ def main(argv: list[str] | None = None) -> int:
             max_calls = args.llm_max_calls if args.llm_max_calls is not None else (20 if automatic else 1)
             budget_rmb = args.llm_budget_rmb if args.llm_budget_rmb is not None else ("20" if automatic else "0.10")
 
-            def make_gateway(spec: dict[str, Any], session_dir: Path) -> Any:
+            def make_gateway(spec: dict[str, Any] | None, session_dir: Path) -> Any:
                 config = read_json(args.llm_config, error_code="API_CONFIG_INVALID")
-                # 任务识别成功后才加载本项目 .env；不搜索父目录。
+                # 显式 B LLM 模式在解析前初始化；规则模式仍在识别成功后初始化。
                 api_key = load_api_key(PROJECT_ROOT / ".env")
                 print("学校 API 模式：已从项目根 .env 加载 key。", flush=True)
                 task_budget = None
@@ -1029,6 +1065,8 @@ def main(argv: list[str] | None = None) -> int:
             test_config_path=args.test_config,
             task_directory=args.task,
             max_trials=args.max_trials,
+            b_analysis=args.b_analysis,
+            task_documents=args.task_doc,
         )
         return 0 if read_json(path)["status"] == "success" else 1
     except (EOFError, KeyboardInterrupt):
