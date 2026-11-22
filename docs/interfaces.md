@@ -1,5 +1,7 @@
 # 模块接口
 
+新增显式 B LLM 接口与 TaskSpec 1.0 可选 `preprocessing` 见 [B 三项升级](b-llm-upgrades.md)。它复用 D 网关，不改变 C/D 数据清单。`run_project(..., b_analysis='llm')` 仅用于 school + task 目录，需解析前可用的持久预算账本；默认规则路径不变。
+
 main 负责组装 A/B/C/D。A 的实现可以替换，B 的准备数据协议、C 的执行协议和 D 的独立评分流程保持稳定。学校模式只替换 A 的决策来源，并通过 D 的网关发请求与记账。
 
 ## A 的控制器
@@ -34,6 +36,8 @@ school 模式下 `--llm-max-calls` 限制本次主会话的请求尝试数量。
 自动 `--task` 默认启用增强搜索；兼容 `--config` 需显式加 `--search-config configs/search-defaults.json`。`confirmation_seed_offsets` 默认是空列表；只有配置了正偏移、且任务轮数与 session 时间仍有余量时，主程序才按 validation 分数稳定排序最多两个候选执行 C-only seed 复核。确认轮不发新的 LLM 请求，实际 seed 写入 Plan/history。网关 usage unknown 时不做确认。API 在已有成功评分后失败时，summary 保持 `failed` 并保存错误；若能安全冻结先前最佳成功实验，会提供 `partial_bundle_path`，不会继续训练或调用 API。
 
 ## B/C/D 保持的接口
+
+B 的可选样本索引、混合特征处理和无 test 开发模式见 [B 优化交接](b-improvements.md)。`discover_task_directory()` 返回的 `test_descriptor_path` 可能为 `None`，调用方仅在该路径存在时进入最终 test。
 
 - **B**：`prepare_data(task_spec, data_root) -> dict`。B 读任务配置声明的 train/validation，拟合预处理器仅使用 train；向 C 提供 data manifest，向 D 单独提供 validation labels 和 evaluation manifest。
 - **C**：`execute(plan, data_manifest_path, runs_root) -> result_relpath`。接收 main 校验后的固定计划，返回相对 runs root 的结果 JSON 路径。Plan/Manifest 1.0 保持表格协议；2.0 携带文本或图像表示与注册 pipeline。C 只读 train 标签、验证特征和验证 ID。

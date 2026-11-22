@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-20",
+  "timezone": "Asia/Shanghai",
+  "base_commit": "3d6c2c0f51f7c6af62bc9c65a4e1114a51d15daa",
+  "runner": "stdlib unittest; not full pytest",
+  "real_llm_calls": 0,
+  "synthetic_inputs_only": true,
+  "total_run": 68,
+  "total_passed": 66,
+  "total_skipped": 2,
+  "suites": [
+    {
+      "module": "test_b_llm.py",
+      "run": 18,
+      "passed": 18,
+      "skipped": 0,
+      "seconds": 16.126,
+      "log": ".cache/b-three-upgrades-4e1ea443/test_b_llm.final.log"
+    },
+    {
+      "module": "test_b_improvements.py",
+      "run": 17,
+      "passed": 17,
+      "skipped": 0,
+      "seconds": 14.651,
+      "log": ".cache/b-three-upgrades-4e1ea443/test_b_improvements.py.log"
+    },
+    {
+      "module": "test_task_directory.py",
+      "run": 19,
+      "passed": 17,
+      "skipped": 2,
+      "seconds": 3.076,
+      "log": ".cache/b-three-upgrades-4e1ea443/test_task_directory.py.log"
+    },
+    {
+      "module": "test_task_run.py",
+      "run": 14,
+      "passed": 14,
+      "skipped": 0,
+      "seconds": 58.222,
+      "log": ".cache/b-three-upgrades-4e1ea443/test_task_run.py.log"
+    }
+  ],
+  "source_sha256_lf_normalized": {
+    "data_b/llm_analysis.py": "82544fd90b9a9ce7a3824aac60d8a5a24832767d05259ed4788e7d834114e583",
+    "data_b/profiling.py": "c46bbd37d14ed23472307542b703d35eb7109c4f47a75d27cac456c41059d958",
+    "data_b/sample_index.py": "dcdf032fa3d50705621603473e869f59cf046c8fa00c769aec78c5ceeef2306b",
+    "tests/test_b_improvements.py": "dd48762d6c6c1cca39f25d116433a8bae5636df647e87b99e1948ba7af2fd366",
+    "tests/test_b_llm.py": "864ea7746f672f00c4a88e50824425f5012eec4923d1e6095d77e2913ef19484",
+    "agent_a/upstream/llm_planner.py": "a2f24cd904471a4954201d3566a215813e0d4fb73388bbe72dec905e27c23fc2",
+    "data_b/prepare.py": "21a1d07a04c3036ccc756d524415998e83a26feab5d0cc40cbc1d35743bb61a0",
+    "data_b/prepare_modalities.py": "09bd4970691f098909021be36119aa1fc73328b736b1302bd9898acfa8c4b218",
+    "data_b/preprocessing.py": "2b026391df564aece9773ce15210aee462705e98bc4c5efdc9a6853e0546fcb1",
+    "data_b/raw_reader.py": "849dfe7f5f595a2e26b2859b9b54cc9953150014f21de090e9d191a03d70b135",
+    "data_b/task_directory.py": "b0144d845b0a1538a3aaa821200ede92a6d39d79d5801bb7427ddb8e67f81898",
+    "main.py": "7e2664ad4698c97a34c0ce7067658abaa12650ec4bdc15c0839aaed87cef1f26",
+    "tests/test_task_directory.py": "75e7620b2fb019e8bc13933c3a273585dc2985703817217cf5f9e685b302dd4d"
+  },
+  "environment": {
+    "python": "3.14.0",
+    "packages": {
+      "numpy": "2.3.5",
+      "pandas": "2.3.3",
+      "scikit-learn": "1.7.2",
+      "joblib": "1.5.2"
+    }
+  },
+  "limitations": [
+    "Real Qwen/DeepSeek response quality and billing unverified",
+    "pytest/ruff unavailable",
+    "Windows symlink tests skipped",
+    "Two known CSV course datasets not rerun; regression uses synthetic data"
+  ]
+}

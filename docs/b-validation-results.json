@@ -1,0 +1,65 @@
+{
+  "date": "2026-11-14",
+  "timezone": "Asia/Shanghai",
+  "base_commit": "3d6c2c0f51f7c6af62bc9c65a4e1114a51d15daa",
+  "runner": "stdlib unittest; not a full pytest run",
+  "synthetic_inputs_only": true,
+  "real_llm_calls": 0,
+  "total_run": 50,
+  "total_passed": 48,
+  "total_skipped": 2,
+  "suites": [
+    {
+      "module": "test_b_improvements.py",
+      "run": 17,
+      "passed": 17,
+      "skipped": 0,
+      "seconds": 22.725,
+      "log": ".cache/b-opt-validation-5782323e/test_b_improvements.final.log"
+    },
+    {
+      "module": "test_task_directory.py",
+      "run": 19,
+      "passed": 17,
+      "skipped": 2,
+      "seconds": 3.188,
+      "log": ".cache/b-opt-validation-5782323e/test_task_directory.py.log"
+    },
+    {
+      "module": "test_task_run.py",
+      "run": 14,
+      "passed": 14,
+      "skipped": 0,
+      "seconds": 90.588,
+      "log": ".cache/b-opt-validation-5782323e/test_task_run.py.log"
+    }
+  ],
+  "source_sha256": {
+    "data_b/prepare.py": "4373384e26fb1dbb38d19dccc541879f9fc6df0487cc6539e55b816312903e8e",
+    "data_b/prepare_modalities.py": "09bd4970691f098909021be36119aa1fc73328b736b1302bd9898acfa8c4b218",
+    "data_b/preprocessing.py": "06fb7734f8c5981376d66fd6f1aac9cb883a4ef9ad09a76663af2437d058d8be",
+    "data_b/raw_reader.py": "849dfe7f5f595a2e26b2859b9b54cc9953150014f21de090e9d191a03d70b135",
+    "data_b/task_directory.py": "235c84746dcb13e8d91bc539802ef3a1d5b569d6b78482c6cad201e3cd12b2be",
+    "data_b/profiling.py": "ceea9be40a735b550948a0003d9743fd9f7e91d848e7a2373e43c064d232edc3",
+    "data_b/sample_index.py": "dcdf032fa3d50705621603473e869f59cf046c8fa00c769aec78c5ceeef2306b",
+    "agent_a/upstream/llm_planner.py": "a2f24cd904471a4954201d3566a215813e0d4fb73388bbe72dec905e27c23fc2",
+    "main.py": "3305b6ec1d5e973d67ca9195646ca7e4887bda1579588e5b10dc7164f3102a1e",
+    "tests/test_b_improvements.py": "dd48762d6c6c1cca39f25d116433a8bae5636df647e87b99e1948ba7af2fd366",
+    "tests/test_task_directory.py": "75e7620b2fb019e8bc13933c3a273585dc2985703817217cf5f9e685b302dd4d"
+  },
+  "limitations": [
+    "pytest/ruff unavailable; no renewed TLS troubleshooting",
+    "two Windows symlink permission skips",
+    "no real course dataset or school API evaluation"
+  ],
+  "environment": {
+    "python": "3.14.0",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "packages": {
+      "numpy": "2.3.5",
+      "pandas": "2.3.3",
+      "scikit-learn": "1.7.2",
+      "joblib": "1.5.2"
+    }
+  }
+}

@@ -1,5 +1,7 @@
 # 从任务目录全自动运行
 
+下述默认规则入口保留。任意命名文件的显式 LLM 解析、质量诊断与预处理配置需 `--b-analysis llm`，详见 [B 三项升级](b-llm-upgrades.md)。
+
 统一入口为 `main.py run --task <目录>`。选择学校模型时加 `--planner school`；任务相关的 schema、列名、标签、指标、样本数及 test 配置不由操作者填写。
 
 ```bash
@@ -24,7 +26,9 @@ CSV 中 README/info 明确列出的输入列优先于自动猜测，额外列记
 
 发现阶段只读取说明、训练和验证分区；类别全集只从 train 建立。test CSV/NPY 不打开、不转换、不计算内容摘要。生成的 `task_input/`、`task.snapshot.json`、`task.discovery.json` 和有界 `task_context.json` 记录输入解释与来源；README 摘要作为任务数据传给 A，不能更改执行权限或运行任意代码。
 
-搜索完成后，程序先冻结 validation 最优模型，再依照先前确定的读取规则转换 test 并评分。`test_evaluation.json` 记录原始输入与派生输入摘要，`test_predictions.csv` 记录顺序一致的预测；test 分数不反馈给 A。最终评分失败保留 frozen bundle。
+train 是必需分区，validation 和 test 都可选。无 test 时仍搜索并冻结 validation 最优模型，summary 标记 `not_requested`；提供 test 时，冻结后才转换并评分。`test_evaluation.json` 记录原始输入与派生输入摘要，`test_predictions.csv` 记录顺序一致的预测；test 分数不反馈给 A。最终评分失败保留 frozen bundle。
+
+CSV 原始 ID 与分层留出的原始行号现在保存在样本索引中。混合表格独立处理数值、类别和文本列，纯文本保留原有稀疏流程。详情、可选 TaskSpec 字段及边界见 [B 优化交接](b-improvements.md)。
 
 主程序同时输出由训练类别频率得到的 validation 多数类 baseline 及最终方案相对提升；这项基线不会读取 test，也不会替代真实验证评分。搜索有可能在达到 20 轮或用完费用前按 patience、实验时间或其他硬限制停止；上限不是消费/调用目标。
 

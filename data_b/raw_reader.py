@@ -83,14 +83,25 @@ def load_feature_frame(
         raise ValueError("feature_columns 必须是非空且不重复的列名列表")
     if set(feature_types) != set(feature_columns):
         raise ValueError("feature_types 必须且只能覆盖 feature_columns")
-    if any(value not in {"categorical", "numeric"} for value in feature_types.values()):
-        raise ValueError("feature_types 的值必须为 categorical 或 numeric")
+    if any(value not in {"categorical", "numeric", "text"} for value in feature_types.values()):
+        raise ValueError("feature_types 的值必须为 categorical、numeric 或 text")
     matrix = _read_matrix(Path(features_path), feature_columns)
     columns: dict[str, np.ndarray] = {}
     for index, name in enumerate(feature_columns):
         values = matrix[:, index]
         if feature_types[name] == "numeric":
             columns[name] = _numeric_column(values, name)
+        elif feature_types[name] == "text":
+            text = []
+            for value in values:
+                if _is_missing(value):
+                    value = ""
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="strict")
+                if not isinstance(value, str) or "\0" in value or len(value) > 100_000:
+                    raise ValueError(f"文本特征 {name!r} 必须是受限字符串")
+                text.append(value)
+            columns[name] = np.asarray(text, dtype=object)
         else:
             columns[name] = np.asarray(
                 [typed_category_token(value) for value in values], dtype=object

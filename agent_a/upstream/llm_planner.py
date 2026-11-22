@@ -19,6 +19,7 @@ recorded through the shared BudgetTracker when the gateway returns them.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Callable
 
@@ -173,6 +174,32 @@ def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, An
             name = str(value)
             type_counts[name] = type_counts.get(name, 0) + 1
         compact["feature_type_counts"] = type_counts
+    quality = profile.get("quality_summary")
+    if isinstance(quality, dict):
+        compact["quality_summary"] = {
+            str(key)[:64]: value for key, value in list(quality.items())[:16]
+            if type(value) in (int, float, bool) and math.isfinite(value)
+        }
+    statistics = profile.get("column_statistics")
+    if isinstance(statistics, list):
+        selected = []
+        for field in statistics[:(4 if abbreviated else 8)]:
+            if not isinstance(field, dict):
+                continue
+            item = {"name": _short_text(field.get("name", ""), 64),
+                    "kind": _short_text(field.get("kind", ""), 16)}
+            for key in ("missing_fraction", "unique_count", "constant"):
+                value = field.get(key)
+                if type(value) in (int, float, bool) and math.isfinite(value):
+                    item[key] = value
+            lengths = field.get("length")
+            if isinstance(lengths, dict):
+                item["length"] = {key: lengths[key] for key in ("mean", "p95", "max", "empty_count")
+                                  if type(lengths.get(key)) in (int, float) and math.isfinite(lengths[key])}
+            selected.append(item)
+        compact["column_statistics_sample"] = selected
+        if len(statistics) > len(selected):
+            compact["column_statistics_omitted"] = len(statistics) - len(selected)
     return compact
 
 

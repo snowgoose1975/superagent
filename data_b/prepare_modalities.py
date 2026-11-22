@@ -20,6 +20,8 @@ from .modality_readers import (
 )
 from .npy_reader import read_npy_array
 from .raw_reader import typed_category_token
+from .profiling import modality_profile
+from .sample_index import load_sample_index, save_combined_index
 
 _ARTIFACTS = (
     "X_train.data",
@@ -30,6 +32,7 @@ _ARTIFACTS = (
     "label_mapping.json",
     "evaluation_manifest.json",
     "metadata/profile.json",
+    "metadata/sample_index.csv",
     "data_manifest.json",
 )
 _TASK_FIELDS = {
@@ -132,7 +135,7 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     for name, split in partitions.items():
         if (
             not isinstance(split, dict)
-            or set(split) != _SPLIT_FIELDS
+            or not _SPLIT_FIELDS <= set(split) <= _SPLIT_FIELDS | {"sample_ids_path"}
             or type(split["n_samples"]) is not int
             or split["n_samples"] < 1
         ):
@@ -187,7 +190,7 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
 
 def _load_split(
     source_root: Path, spec: dict[str, Any], split_name: str
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], list[dict]]:
     split = spec["partitions"][split_name]
     feature_path = (source_root / split["features_path"]).resolve()
     label_path = (source_root / split["labels_path"]).resolve()
@@ -211,13 +214,15 @@ def _load_split(
     after = {"features": _sha256(feature_path), "labels": _sha256(label_path)}
     if before != after:
         raise ValueError(f"{split_name} 源文件在读取期间发生变化")
+    sample_rows, sample_hash = load_sample_index(source_root, split, split_name)
     return X, y, {
         "features": {
             "relative_path": split["features_path"],
             "sha256": after["features"],
         },
         "labels": {"relative_path": split["labels_path"], "sha256": after["labels"]},
-    }
+        **sample_hash,
+    }, sample_rows
 
 
 def _signature(spec: dict[str, Any], source_hashes: dict[str, Any]) -> str:
@@ -228,6 +233,8 @@ def _signature(spec: dict[str, Any], source_hashes: dict[str, Any]) -> str:
             "modality_readers.py",
             "npy_reader.py",
             "raw_reader.py",
+            "profiling.py",
+            "sample_index.py",
         )
     }
     material = {
@@ -272,6 +279,7 @@ def _cache(directory: Path, signature: str) -> dict[str, Any]:
         profile_path=str((directory / "metadata" / "profile.json").resolve()),
         preprocessor_path=None,
         label_mapping_path=str((directory / "label_mapping.json").resolve()),
+        sample_index_path=str((directory / "metadata" / "sample_index.csv").resolve()),
         reused=True,
     )
     return result
@@ -291,8 +299,8 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
         if not directory.exists():
             directory.mkdir(parents=True, exist_ok=False)
             fresh = directory
-        X_train_raw, y_train_raw, train_hashes = _load_split(source_root, spec, "train")
-        X_valid_raw, y_valid_raw, valid_hashes = _load_split(source_root, spec, "validation")
+        X_train_raw, y_train_raw, train_hashes, train_index = _load_split(source_root, spec, "train")
+        X_valid_raw, y_valid_raw, valid_hashes, valid_index = _load_split(source_root, spec, "validation")
         label_tokens = [typed_category_token(item) for item in spec["label_values"]]
         label_to_id = {token: index for index, token in enumerate(label_tokens)}
 
@@ -332,7 +340,7 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
             _save_npy(directory / "X_train.data", X_train_raw)
             _save_npy(directory / "X_valid.data", X_valid_raw)
         _save_npy(directory / "y_train.npy", y_train)
-        valid_ids = [f"validation_{index:09d}" for index in range(len(X_valid_raw))]
+        valid_ids = [row["sample_id"] for row in valid_index]
         with (directory / "valid_ids.csv").open("x", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream, lineterminator="\n")
             writer.writerow(["sample_id"])
@@ -363,8 +371,10 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
                 "feature_names": feature_names,
                 "image_shape": spec["modality"].get("image_shape"),
                 "train_label_counts": train_counts,
+                **modality_profile(X_train_raw, spec["modality"]),
             },
         )
+        save_combined_index(metadata_dir / "sample_index.csv", train_index, valid_index)
         mapping = {
             "classes": classes,
             "label_values": spec["label_values"],
@@ -425,6 +435,7 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
             "profile_path": str((metadata_dir / "profile.json").resolve()),
             "preprocessor_path": None,
             "label_mapping_path": str((directory / "label_mapping.json").resolve()),
+            "sample_index_path": str((metadata_dir / "sample_index.csv").resolve()),
             "source_signature": signature,
             "source_file_sha256": source_hashes,
             "artifact_sha256": file_hashes,
