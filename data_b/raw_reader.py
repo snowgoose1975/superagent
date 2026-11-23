@@ -1,4 +1,4 @@
-"""按任务显式声明读取原始特征；不读取标签、test 或推断列语义。"""
+"""Read raw features according to the task's declared column types."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _is_missing(value: Any) -> bool:
 
 
 def typed_category_token(value: Any) -> str | float:
-    """把类别值编码成带类型的稳定字符串，避免数字 1 与字符串“1”碰撞。"""
+    """Encode categories as stable typed strings so numeric 1 and textual 1 are distinct."""
     if _is_missing(value):
         return np.nan
     if isinstance(value, np.generic):
@@ -33,14 +33,14 @@ def typed_category_token(value: Any) -> str | float:
         kind, text = "int", str(value)
     elif type(value) is float:
         if not math.isfinite(value):
-            raise ValueError("分类特征不允许无穷值")
+            raise ValueError("Categorical features cannot contain infinity")
         kind, text = "float", value.hex()
     elif type(value) is str:
         kind, text = "str", value
     elif isinstance(value, bytes):
         kind, text = "bytes", value.hex()
     else:
-        raise ValueError(f"不支持的类别标量类型：{type(value).__name__}")
+        raise ValueError(f"Unsupported categorical scalar type: {type(value).__name__}")
     return json.dumps([kind, text], ensure_ascii=False, separators=(",", ":"))
 
 
@@ -53,15 +53,15 @@ def _numeric_column(values: np.ndarray, name: str) -> np.ndarray:
         if isinstance(value, np.generic):
             value = value.item()
         if type(value) is bool or not isinstance(value, (int, float, str)):
-            raise ValueError(f"数值特征 {name!r} 含不支持的值类型")
+            raise ValueError(f"Numeric feature {name!r} contains an unsupported value type")
         if isinstance(value, str) and not value.strip():
-            raise ValueError(f"数值特征 {name!r} 含空字符串；缺失值必须使用 None/NaN")
+            raise ValueError(f"Numeric feature {name!r} contains an empty string. Use None or NaN for missing values.")
         try:
             number = float(value)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"数值特征 {name!r} 含非数值内容") from exc
+            raise ValueError(f"Numeric feature {name!r} contains a nonnumeric value") from exc
         if not math.isfinite(number):
-            raise ValueError(f"数值特征 {name!r} 含无穷值")
+            raise ValueError(f"Numeric feature {name!r} contains infinity")
         output[index] = number
     return output
 
@@ -69,7 +69,7 @@ def _numeric_column(values: np.ndarray, name: str) -> np.ndarray:
 def _read_matrix(path: Path, feature_columns: list[str]) -> np.ndarray:
     values = read_npy_array(path)
     if values.ndim != 2 or values.shape[1] != len(feature_columns):
-        raise ValueError(f"特征数组 {path.name} 的列数/维度与 feature_columns 不符")
+        raise ValueError(f"Feature array {path.name} dimensions do not match feature_columns")
     return values
 
 
@@ -78,13 +78,13 @@ def load_feature_frame(
     feature_columns: list[str],
     feature_types: dict[str, str],
 ) -> pd.DataFrame:
-    """读取单个特征 NPY 并按声明转换；不会访问其配对标签或其它分区。"""
+    """Read one NPY feature file and apply its declared column conversions."""
     if not feature_columns or len(set(feature_columns)) != len(feature_columns):
-        raise ValueError("feature_columns 必须是非空且不重复的列名列表")
+        raise ValueError("feature_columns must contain unique nonempty names")
     if set(feature_types) != set(feature_columns):
-        raise ValueError("feature_types 必须且只能覆盖 feature_columns")
+        raise ValueError("feature_types must cover exactly feature_columns")
     if any(value not in {"categorical", "numeric", "text"} for value in feature_types.values()):
-        raise ValueError("feature_types 的值必须为 categorical、numeric 或 text")
+        raise ValueError("feature_types values must be categorical, numeric, or text")
     matrix = _read_matrix(Path(features_path), feature_columns)
     columns: dict[str, np.ndarray] = {}
     for index, name in enumerate(feature_columns):
@@ -99,7 +99,7 @@ def load_feature_frame(
                 if isinstance(value, bytes):
                     value = value.decode("utf-8", errors="strict")
                 if not isinstance(value, str) or "\0" in value or len(value) > 100_000:
-                    raise ValueError(f"文本特征 {name!r} 必须是受限字符串")
+                    raise ValueError(f"Text feature {name!r} must be a string within the allowed bounds")
                 text.append(value)
             columns[name] = np.asarray(text, dtype=object)
         else:

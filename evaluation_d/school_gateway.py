@@ -1,4 +1,4 @@
-"""学校 chat/completions 网关与独立开发调用账本。"""
+"""School chat-completions gateway and per-session development ledger."""
 
 from __future__ import annotations
 
@@ -16,8 +16,11 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from evaluation_d.task_budget import TaskBalanceExhausted
+
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_MAX_OUTPUT_TOKENS = 1024
+_MAX_OUTPUT_TOKENS = 4096
+_DEFAULT_OUTPUT_TOKENS = 1024
 _MAX_INPUT_BYTES = 16384
 _CHAT_TEMPLATE_OVERHEAD_BYTES = 256
 _SECRET_CONFIG_KEYS = {
@@ -32,7 +35,7 @@ _SECRET_CONFIG_KEYS = {
 
 
 class GatewayError(RuntimeError):
-    """不暴露服务端正文、认证头或底层异常文本的安全错误。"""
+    """Error containing no response body, authentication headers, or raw transport exception."""
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
@@ -41,7 +44,7 @@ class GatewayError(RuntimeError):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """禁止把 Authorization 转发到重定向目标。"""
+    """Prevent forwarding Authorization to a redirect target."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -54,7 +57,7 @@ def _urllib_transport(
     try:
         response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        # HTTPError body 不读取、不记录；特别是 3xx 只作为失败返回，不跟随。
+        # Discard HTTP error bodies and return redirects as failures.
         return int(exc.code), exc.headers or {}, b""
     with response:
         body = response.read(_MAX_RESPONSE_BYTES + 1)
@@ -66,11 +69,11 @@ def _safe_config(config: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         try:
             value = json.loads(Path(config).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            raise GatewayError("CONFIG_INVALID", "学校网关配置无法读取") from None
+            raise GatewayError("CONFIG_INVALID", "Cannot read the school gateway configuration.") from None
     else:
         value = config
     if not isinstance(value, Mapping):
-        raise GatewayError("CONFIG_INVALID", "学校网关配置必须是 JSON 对象")
+        raise GatewayError("CONFIG_INVALID", "School gateway configuration must be a JSON object.")
 
     def reject_secrets(item: Any) -> bool:
         if isinstance(item, Mapping):
@@ -84,7 +87,13 @@ def _safe_config(config: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         return False
 
     if reject_secrets(value):
-        raise GatewayError("CONFIG_INVALID", "网关配置禁止包含密钥或认证字段")
+        raise GatewayError("CONFIG_INVALID", "Gateway configuration must not contain secrets or authentication fields.")
+    for optional_label in ("pricing_profile", "pricing_tier"):
+        label = value.get(optional_label)
+        if label is not None and (
+            not isinstance(label, str) or not label.strip() or "\n" in label or "\r" in label
+        ):
+            raise GatewayError("CONFIG_INVALID", f"{optional_label} must be a nonempty single-line string.")
     required = {
         "url",
         "model",
@@ -92,14 +101,16 @@ def _safe_config(config: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         "output_cny_per_million",
     }
     if not required.issubset(value):
-        raise GatewayError("CONFIG_INVALID", "学校网关配置缺少必需字段")
-    # 只复制白名单配置字段，开发账本不保存原配置中的额外数据。
+        raise GatewayError("CONFIG_INVALID", "School gateway configuration is missing required fields.")
+    # Keep only approved configuration fields so extra input cannot reach the ledger.
     return {
         "url": value["url"],
         "model": value["model"],
         "input_cny_per_million": value["input_cny_per_million"],
         "output_cny_per_million": value["output_cny_per_million"],
-        "max_tokens": value.get("max_tokens", 1024),
+        "pricing_profile": value.get("pricing_profile"),
+        "pricing_tier": value.get("pricing_tier"),
+        "max_tokens": value.get("max_tokens", _DEFAULT_OUTPUT_TOKENS),
         "max_input_tokens": value.get("max_input_tokens", _MAX_INPUT_BYTES),
         "timeout": value.get("timeout", 90),
     }
@@ -107,30 +118,30 @@ def _safe_config(config: Mapping[str, Any] | str | Path) -> dict[str, Any]:
 
 def _decimal(value: Any, field: str) -> Decimal:
     if isinstance(value, bool):
-        raise GatewayError("CONFIG_INVALID", f"{field} 必须是非负十进制数")
+        raise GatewayError("CONFIG_INVALID", f"{field} must be a nonnegative decimal.")
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError):
-        raise GatewayError("CONFIG_INVALID", f"{field} 必须是非负十进制数") from None
+        raise GatewayError("CONFIG_INVALID", f"{field} must be a nonnegative decimal.") from None
     if not result.is_finite() or result < 0:
-        raise GatewayError("CONFIG_INVALID", f"{field} 必须是非负十进制数")
+        raise GatewayError("CONFIG_INVALID", f"{field} must be a nonnegative decimal.")
     return result
 
 
 def _strict_int(value: Any, field: str, *, minimum: int, maximum: int) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
-        raise GatewayError("CONFIG_INVALID", f"{field} 超出允许范围")
+        raise GatewayError("CONFIG_INVALID", f"{field} is out of range.")
     return value
 
 
 def _validate_url(value: Any) -> str:
     if not isinstance(value, str):
-        raise GatewayError("CONFIG_INVALID", "网关 URL 必须为 HTTPS URL")
+        raise GatewayError("CONFIG_INVALID", "The gateway URL must use HTTPS.")
     try:
         parsed = urlsplit(value)
         port = parsed.port
     except ValueError:
-        raise GatewayError("CONFIG_INVALID", "网关 URL 格式无效") from None
+        raise GatewayError("CONFIG_INVALID", "The gateway URL format is invalid.") from None
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -140,7 +151,7 @@ def _validate_url(value: Any) -> str:
         or parsed.fragment
         or (port is not None and port != 443)
     ):
-        raise GatewayError("CONFIG_INVALID", "网关仅允许无凭据、无查询参数的 HTTPS URL")
+        raise GatewayError("CONFIG_INVALID", "Use an HTTPS gateway URL without credentials, query parameters, or fragments.")
     return value
 
 
@@ -180,7 +191,7 @@ def _reject_json_constant(_value: str) -> None:
 
 
 class SchoolGateway:
-    """默认最多一次学校 API 调用；失败/未知 usage 后永久封锁本实例。"""
+    """Reserve and account for each school API request before returning a result."""
 
     def __init__(
         self,
@@ -196,7 +207,7 @@ class SchoolGateway:
         self._url = _validate_url(self._config["url"])
         model = self._config["model"]
         if not isinstance(model, str) or not model.strip() or "\n" in model or "\r" in model:
-            raise GatewayError("CONFIG_INVALID", "model 必须是非空单行字符串")
+            raise GatewayError("CONFIG_INVALID", "model must be a nonempty single-line string.")
         self._model = model
         self._input_price = _decimal(self._config["input_cny_per_million"], "input_cny_per_million")
         self._output_price = _decimal(
@@ -213,7 +224,7 @@ class SchoolGateway:
         )
         timeout = self._config["timeout"]
         if type(timeout) not in (int, float) or not 0 < timeout <= 300:
-            raise GatewayError("CONFIG_INVALID", "timeout 必须在 0 到 300 秒之间")
+            raise GatewayError("CONFIG_INVALID", "timeout must be greater than zero and at most 300 seconds.")
         self._configured_timeout = float(timeout)
         self._timeout = self._configured_timeout
         if (
@@ -221,17 +232,29 @@ class SchoolGateway:
             or not api_key.strip()
             or any(c in api_key for c in "\r\n\0")
         ):
-            raise GatewayError("KEY_REQUIRED", "必须通过运行时参数提供有效 API key")
+            raise GatewayError("KEY_REQUIRED", "Supply a valid API key at runtime.")
         if type(max_calls) is not int or max_calls < 1:
-            raise GatewayError("CONFIG_INVALID", "max_calls 必须为正整数")
+            raise GatewayError("CONFIG_INVALID", "max_calls must be a positive integer.")
         self._api_key = api_key
         self._max_calls = max_calls
         self._budget = _decimal(budget_rmb, "budget_rmb")
         if self._budget <= 0:
-            raise GatewayError("CONFIG_INVALID", "budget_rmb 必须大于零")
+            raise GatewayError("CONFIG_INVALID", "budget_rmb must be greater than zero.")
         self._transport = transport if transport is not None else _urllib_transport
         self._is_injected = transport is not None
         self._task_budget_ledger = task_budget_ledger
+        task_price_profile = (
+            task_budget_ledger.snapshot().get("price_profile")
+            if task_budget_ledger is not None
+            else None
+        )
+        self._pricing_profile = self._config.get("pricing_profile")
+        self._pricing_tier = self._config.get("pricing_tier")
+        self._task_budget_profile = (
+            task_price_profile.get("profile_id")
+            if isinstance(task_price_profile, dict)
+            else None
+        )
 
         self._known_input_tokens = 0
         self._known_output_tokens = 0
@@ -241,6 +264,7 @@ class SchoolGateway:
         self._usage_pending = False
         self._blocked = False
         self._blocked_reason: str | None = None
+        self._last_completion: dict[str, Any] | None = None
         self._call_attempts = 0
         self._real_llm_calls = 0
         self._mock_calls = 0
@@ -248,7 +272,7 @@ class SchoolGateway:
 
         root = Path(ledger_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        # 使用短编号，避免 Windows 深目录中的元数据路径超过文件 API 限制。
+        # Use short session IDs to limit metadata path lengths on Windows.
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self._session_id = f"api-{stamp}-{uuid.uuid4().hex[:8]}"
         self._session_dir = root / self._session_id
@@ -266,7 +290,11 @@ class SchoolGateway:
 
     @property
     def remaining_budget_rmb(self) -> float:
-        return float(self._budget - self._known_cost - self._reserved)
+        remaining = self._remaining_decimal()
+        if self._task_budget_ledger is not None:
+            task_remaining = Decimal(self._task_budget_ledger.snapshot()["remaining_rmb"])
+            remaining = min(remaining, task_remaining)
+        return float(remaining)
 
     @property
     def can_call(self) -> bool:
@@ -277,23 +305,53 @@ class SchoolGateway:
             and self._remaining_decimal() >= self._worst_case_cost()
         )
 
+    @property
+    def paid_limit_reason(self) -> str | None:
+        if self._usage_pending or self._blocked:
+            return None
+        if self._call_attempts >= self._max_calls:
+            return "CALL_LIMIT"
+        if self._remaining_decimal() < self._worst_case_cost():
+            return "BUDGET_EXCEEDED"
+        return None
+
+    def recover_empty_reply(self) -> bool:
+        """Reopen only a request whose unusable reply was fully accounted for."""
+        with self._lock:
+            if (
+                self._blocked_reason != "INVALID_RESPONSE"
+                or self._usage_unknown or self._usage_pending or self._reserved
+            ):
+                return False
+            self._blocked = False
+            self._blocked_reason = None
+            self._persist_metadata()
+            return True
+
     def set_request_timeout_cap(self, seconds: float | None) -> None:
         """Bound the next synchronous request by the remaining session window."""
         if seconds is None:
             self._timeout = self._configured_timeout
             return
         if type(seconds) not in (int, float):
-            raise GatewayError("TIMEOUT_INVALID", "剩余时间不足以发起学校 API 请求")
+            raise GatewayError("TIMEOUT_INVALID", "Insufficient time remains for a school API request.")
         try:
             cap = float(seconds)
         except (OverflowError, ValueError):
-            raise GatewayError("TIMEOUT_INVALID", "剩余时间不足以发起学校 API 请求") from None
+            raise GatewayError("TIMEOUT_INVALID", "Insufficient time remains for a school API request.") from None
         if not math.isfinite(cap) or cap <= 0:
-            raise GatewayError("TIMEOUT_INVALID", "剩余时间不足以发起学校 API 请求")
+            raise GatewayError("TIMEOUT_INVALID", "Insufficient time remains for a school API request.")
         self._timeout = min(self._configured_timeout, cap)
 
     def _remaining_decimal(self) -> Decimal:
         return self._budget - self._known_cost - self._reserved
+
+    def _pricing_log_fields(self) -> dict[str, str | None]:
+        return {
+            "pricing_profile": self._pricing_profile,
+            "pricing_tier": self._pricing_tier,
+            "task_budget_profile": self._task_budget_profile,
+        }
 
     def _worst_case_cost(self) -> Decimal:
         return (
@@ -311,6 +369,7 @@ class SchoolGateway:
             "session_id": self._session_id,
             "model": self._model,
             "url": self._url,
+            **self._pricing_log_fields(),
             "real_llm_calls": self._real_llm_calls,
             "mock_calls": self._mock_calls,
             "call_attempts": self._call_attempts,
@@ -318,6 +377,7 @@ class SchoolGateway:
             "blocked": self._blocked,
             "can_call": self.can_call,
             "blocked_reason": self._blocked_reason,
+            "last_completion": self._last_completion,
             "usage_status": usage_status,
             "input_tokens": None
             if self._usage_unknown or self._usage_pending
@@ -389,6 +449,7 @@ class SchoolGateway:
                 "output_tokens": None,
                 "estimated_cost_rmb": None,
                 "reserved_rmb": format(available_before, "f"),
+                **self._pricing_log_fields(),
             }
         )
         self._persist_metadata()
@@ -426,6 +487,8 @@ class SchoolGateway:
                 "output_tokens": output_tokens,
                 "estimated_cost_rmb": format(cost, "f"),
                 "reserved_rmb": "0",
+                "completion": self._last_completion,
+                **self._pricing_log_fields(),
             }
         )
         self._persist_metadata()
@@ -433,7 +496,7 @@ class SchoolGateway:
             self._block("task_ledger_settle_failed")
             raise GatewayError(
                 "TASK_LEDGER_ERROR",
-                "学校 API usage 已知，但课程预算账本无法结算；本会话已停止",
+                "School API usage is known but ledger settlement failed. The session is blocked.",
             )
         return cost
 
@@ -441,32 +504,32 @@ class SchoolGateway:
         try:
             response = self._transport(request, self._timeout)
         except (TimeoutError, socket.timeout):
-            raise GatewayError("TIMEOUT", "学校 API 请求超时；usage 未知，已封锁本会话") from None
+            raise GatewayError("TIMEOUT", "The school API request timed out. Usage is unknown and the session is blocked.") from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise GatewayError(
-                    "TIMEOUT", "学校 API 请求超时；usage 未知，已封锁本会话"
+                    "TIMEOUT", "The school API request timed out. Usage is unknown and the session is blocked."
                 ) from None
             raise GatewayError(
-                "TRANSPORT_ERROR", "学校 API 连接失败；usage 未知，已封锁本会话"
+                "TRANSPORT_ERROR", "The school API connection failed. Usage is unknown and the session is blocked."
             ) from None
         except Exception:
             raise GatewayError(
-                "TRANSPORT_ERROR", "学校 API 传输失败；usage 未知，已封锁本会话"
+                "TRANSPORT_ERROR", "The school API transport failed. Usage is unknown and the session is blocked."
             ) from None
         if not isinstance(response, tuple) or len(response) != 3:
-            raise GatewayError("TRANSPORT_ERROR", "学校 API transport 返回格式无效")
+            raise GatewayError("TRANSPORT_ERROR", "The school API transport returned an invalid result.")
         status, _headers, body = response
         if type(status) is not int or not isinstance(body, (bytes, bytearray)):
-            raise GatewayError("TRANSPORT_ERROR", "学校 API transport 返回格式无效")
+            raise GatewayError("TRANSPORT_ERROR", "The school API transport returned an invalid result.")
         if len(body) > _MAX_RESPONSE_BYTES:
             raise GatewayError(
-                "RESPONSE_TOO_LARGE", "学校 API 响应超过 2 MiB；usage 未知，已封锁本会话"
+                "RESPONSE_TOO_LARGE", "The school API response exceeded 2 MiB. Usage is unknown and the session is blocked."
             )
         return status, bytes(body)
 
     def call_llm(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        # 同一实例串行预留，避免并发调用绕过 max_calls 或重复花费余额。
+        # Serialize reservations and requests to enforce the call limit and available balance.
         with self._lock:
             return self._call_llm(messages)
 
@@ -474,41 +537,41 @@ class SchoolGateway:
         if not self.can_call:
             if not self._blocked:
                 if self._usage_pending:
-                    code, message = "SESSION_BLOCKED", "上次请求仍有未知用量，不能继续调用"
+                    code, message = "SESSION_BLOCKED", "The previous request has unknown usage. The gateway cannot make another request."
                     self._block("usage_pending")
                 elif self._call_attempts >= self._max_calls:
-                    code, message = "CALL_LIMIT", "学校 API 调用次数已达上限"
+                    code, message = "CALL_LIMIT", "The school API call limit has been reached."
                 else:
-                    code, message = "BUDGET_EXCEEDED", "剩余预算不足以预留本次请求上限"
+                    code, message = "BUDGET_EXCEEDED", "The remaining budget cannot cover the request reservation."
                     self._block("budget_exceeded")
             else:
-                code, message = "SESSION_BLOCKED", "学校 API 会话已封锁，不能继续调用"
+                code, message = "SESSION_BLOCKED", "The school API session is blocked and cannot make another request."
             raise GatewayError(code, message)
         if not isinstance(messages, list) or not messages:
-            raise GatewayError("INPUT_INVALID", "messages 必须是非空消息列表")
+            raise GatewayError("INPUT_INVALID", "messages must be a nonempty list.")
         if any(
             not isinstance(message, dict)
             or not isinstance(message.get("role"), str)
             or not isinstance(message.get("content"), str)
             for message in messages
         ):
-            raise GatewayError("INPUT_INVALID", "每条 message 必须含字符串 role 和 content")
+            raise GatewayError("INPUT_INVALID", "Each message must have string role and content fields.")
         try:
             serialized_messages = json.dumps(
                 messages, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             ).encode("utf-8")
         except (TypeError, ValueError, UnicodeError):
-            raise GatewayError("INPUT_INVALID", "messages 必须是可编码的 JSON 消息列表") from None
+            raise GatewayError("INPUT_INVALID", "messages must be serializable as JSON.") from None
         input_bound_bytes = len(serialized_messages) + _CHAT_TEMPLATE_OVERHEAD_BYTES
         if input_bound_bytes > self._max_input_tokens:
             self._block("input_too_large")
-            raise GatewayError("INPUT_TOO_LARGE", "messages 超过 UTF-8 输入字节上限；未发送请求")
+            raise GatewayError("INPUT_TOO_LARGE", "Messages exceeded the UTF-8 input limit. No request was sent.")
 
         available_before = self._remaining_decimal()
         reserve = self._worst_case_cost()
         if reserve > available_before:
             self._block("budget_exceeded")
-            raise GatewayError("BUDGET_EXCEEDED", "剩余预算不足以预留本次请求上限")
+            raise GatewayError("BUDGET_EXCEEDED", "The remaining budget cannot cover the request reservation.")
 
         self._call_attempts += 1
         attempt = self._call_attempts
@@ -520,12 +583,18 @@ class SchoolGateway:
                     max_input_tokens=self._max_input_tokens,
                     max_output_tokens=self._max_tokens,
                 )
+            except TaskBalanceExhausted:
+                self._call_attempts -= 1
+                self._block("task_budget_exhausted")
+                raise GatewayError(
+                    "TASK_BALANCE_EXHAUSTED", "The task budget cannot cover the reservation. No request was sent.",
+                ) from None
             except Exception:
                 self._call_attempts -= 1
                 self._block("task_budget_reservation_failed")
                 raise GatewayError(
                     "TASK_BUDGET_EXCEEDED",
-                    "课程预算无法预留本次学校 API 请求上限；未发送请求",
+                    "Task budget reservation failed. No request was sent.",
                 ) from None
         if self._is_injected:
             self._mock_calls += 1
@@ -541,6 +610,7 @@ class SchoolGateway:
                 "max_input_tokens": self._max_input_tokens,
                 "max_output_tokens": self._max_tokens,
                 "reserved_rmb": format(reserve, "f"),
+                **self._pricing_log_fields(),
             }
         )
         self._persist_metadata()
@@ -574,7 +644,7 @@ class SchoolGateway:
             raise exc from None
         if not 200 <= status < 300:
             self._unknown(attempt, "HTTP_ERROR", available_before)
-            raise GatewayError("HTTP_ERROR", "学校 API 返回非成功状态；usage 未知，已封锁本会话")
+            raise GatewayError("HTTP_ERROR", "The school API returned an HTTP error. Usage is unknown and the session is blocked.")
         try:
             payload = json.loads(
                 body.decode("utf-8"),
@@ -584,17 +654,17 @@ class SchoolGateway:
         except (UnicodeError, json.JSONDecodeError, ValueError):
             self._unknown(attempt, "INVALID_JSON", available_before)
             raise GatewayError(
-                "INVALID_JSON", "学校 API 响应不是有效 JSON；usage 未知，已封锁本会话"
+                "INVALID_JSON", "The school API returned invalid JSON. Usage is unknown and the session is blocked."
             ) from None
 
         usage = _usage(payload)
         if usage is None:
             self._unknown(attempt, "USAGE_UNKNOWN", available_before)
-            raise GatewayError("USAGE_UNKNOWN", "学校 API 未返回完整有效 usage；已封锁本会话")
+            raise GatewayError("USAGE_UNKNOWN", "The school API did not return valid usage. The session is blocked.")
         input_tokens, output_tokens = usage
         cost = self._charge(input_tokens, output_tokens)
 
-        # 若供应商报告值超过预留的 token 上限，仍如实登记已知费用，再停止本会话。
+        # Record the reported usage even when it exceeds the reservation, then block the session.
         usage_exceeds_reservation = (
             input_tokens > self._max_input_tokens or output_tokens > self._max_tokens
         )
@@ -604,16 +674,33 @@ class SchoolGateway:
             message = choices[0].get("message")
             if isinstance(message, dict):
                 text_value = message.get("content")
-        valid_content = isinstance(text_value, str)
+        valid_content = isinstance(text_value, str) and bool(text_value.strip())
+        finish_reason = (
+            choices[0].get("finish_reason")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else None
+        )
+        self._last_completion = {
+            "attempt": attempt,
+            "has_usable_text": valid_content,
+            "output_limit_reached": output_tokens >= self._max_tokens,
+            "finish_reason": finish_reason if finish_reason in (
+                "stop", "length", "content_filter", "tool_calls", "function_call",
+            ) else None,
+        }
+        details = payload["usage"].get("completion_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= output_tokens:
+            self._last_completion["reasoning_tokens"] = reasoning_tokens
         if usage_exceeds_reservation or not valid_content:
             self._record_known(attempt, input_tokens, output_tokens, status="failed_known")
             error_code = "USAGE_EXCEEDS_LIMIT" if usage_exceeds_reservation else "INVALID_RESPONSE"
             self._block(error_code)
             if usage_exceeds_reservation:
                 raise GatewayError(
-                    error_code, "供应商 usage 超过调用预留上限；已登记费用并封锁本会话"
+                    error_code, "Provider usage exceeded the reservation. The usage was recorded and the session is blocked."
                 )
-            raise GatewayError(error_code, "学校 API 响应缺少有效文本；已登记 usage 并封锁本会话")
+            raise GatewayError(error_code, "The school API reply contained no usable text. Usage was recorded.")
 
         self._record_known(attempt, input_tokens, output_tokens, status="complete")
         return {

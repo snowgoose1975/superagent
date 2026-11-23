@@ -1,4 +1,4 @@
-"""A/B/C/D 共用的输入与文件约定；这里不训练模型、不计算评分。"""
+"""Shared input and artifact contracts for data preparation, training, and evaluation."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from executor_c.model_registry import (
     capabilities as registry_capabilities,
     normalize_params,
     normalize_pipeline,
+    validate_model_pipeline,
 )
 
 SCHEMA_VERSION = "1.0"
@@ -42,7 +43,7 @@ MODEL_PARAMETERS = {
 
 
 class ContractError(ValueError):
-    """可记录在结果中的输入/产物协议错误。"""
+    """Input or artifact contract violation suitable for the result record."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -51,7 +52,7 @@ class ContractError(ValueError):
 
 
 class InvocationError(ValueError):
-    """尚不能建立独立实验目录的调用错误，不会覆盖旧结果。"""
+    """Invocation error raised before the experiment directory can be created."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -60,7 +61,7 @@ class InvocationError(ValueError):
 
 
 def capabilities() -> dict[str, Any]:
-    """A 可以把这份能力清单放进规划提示；C 仍会重新检查输出。"""
+    """Return the planner's model inventory. The executor validates every plan."""
     return registry_capabilities()
 
 
@@ -68,24 +69,24 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("JSON 中存在重复字段")
+            raise ValueError("JSON contains a duplicate field")
         result[key] = value
     return result
 
 
 def _reject_constant(value: str) -> None:
-    raise ValueError("JSON 不允许 NaN 或 Infinity")
+    raise ValueError("JSON cannot contain NaN or Infinity")
 
 
 def _finite_float(value: str) -> float:
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError("JSON 浮点数必须是有限值")
+        raise ValueError("JSON floating-point numbers must be finite")
     return number
 
 
 def read_json(path: str | Path, error_code: str = "DATA_INVALID") -> dict[str, Any]:
-    """读取标准 JSON 对象；不回显原始文件内容，以免错误输入进入日志。"""
+    """Read a standard JSON object while keeping raw input out of error messages."""
     try:
         value = json.loads(
             Path(path).read_text(encoding="utf-8-sig"),
@@ -94,24 +95,24 @@ def read_json(path: str | Path, error_code: str = "DATA_INVALID") -> dict[str, A
             parse_float=_finite_float,
         )
     except (OSError, ValueError, UnicodeError) as exc:
-        raise ContractError(error_code, "无法读取合法的 UTF-8 JSON 对象") from exc
+        raise ContractError(error_code, "Could not read a valid UTF-8 JSON object") from exc
     if not isinstance(value, dict):
-        raise ContractError(error_code, "JSON 最外层必须是对象")
+        raise ContractError(error_code, "The JSON root must be an object")
     return value
 
 
 def write_json(path: str | Path, value: Any, exclusive: bool = True) -> None:
-    """默认使用 x 模式，避免意外覆盖计划、快照和运行证据。"""
+    """Write a new JSON file by default to preserve plans, snapshots, and results."""
     content = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     with Path(path).open("x" if exclusive else "w", encoding="utf-8", newline="\n") as stream:
         stream.write(content)
 
 
 def publish_json(path: str | Path, value: Any) -> None:
-    """写完临时文件后再发布最终结果；每个实验目录只有一个写入者。"""
+    """Publish complete JSON from a temporary file. Each experiment directory has one writer."""
     destination = Path(path)
     if destination.exists():
-        raise FileExistsError("最终结果已经存在，禁止覆盖")
+        raise FileExistsError("The final result already exists")
     pending = destination.with_name(destination.stem + ".pending.json")
     write_json(pending, value)
     pending.rename(destination)
@@ -127,7 +128,7 @@ def sha256_file(path: str | Path) -> str:
 
 def environment_info() -> dict[str, Any]:
     versions: dict[str, str | None] = {}
-    for name in ("numpy", "scikit-learn", "joblib"):
+    for name in ("numpy", "scikit-learn", "joblib", "xgboost-cpu", "xgboost", "catboost"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -141,7 +142,7 @@ def environment_info() -> dict[str, Any]:
 
 def _fields(value: Any, expected: set[str], code: str, context: str) -> None:
     if not isinstance(value, dict) or set(value) != expected:
-        raise ContractError(code, f"{context} 的字段缺失或包含未支持字段，请对照接口说明")
+        raise ContractError(code, f"{context} has missing or unsupported fields")
 
 
 def _integer(value: Any, minimum: int, maximum: int | None = None) -> bool:
@@ -150,60 +151,61 @@ def _integer(value: Any, minimum: int, maximum: int | None = None) -> bool:
 
 def validate_identity(plan: Any) -> tuple[str, str, str]:
     if not isinstance(plan, dict):
-        raise InvocationError("PLAN_INVALID", "计划必须是对象")
+        raise InvocationError("PLAN_INVALID", "The plan must be an object")
     identifiers = []
     for key in ("task_id", "data_version", "experiment_id"):
         value = plan.get(key)
         if not isinstance(value, str) or not IDENTIFIER_PATTERN.fullmatch(value):
-            raise InvocationError("PLAN_INVALID", f"{key} 必须是 1–64 位安全英文编号")
+            raise InvocationError("PLAN_INVALID", f"{key} must be a safe ASCII identifier from 1 to 64 characters")
         identifiers.append(value)
     return tuple(identifiers)
 
 
 def validate_plan(plan: Any) -> dict[str, Any]:
     if not isinstance(plan, dict):
-        raise ContractError("PLAN_INVALID", "实验计划必须是对象")
+        raise ContractError("PLAN_INVALID", "The experiment plan must be an object")
     version = plan.get("schema_version")
     expected = PLAN_FIELDS if version == "1.0" else PLAN_V2_FIELDS if version == "2.0" else set()
-    _fields(plan, expected, "PLAN_INVALID", "实验计划")
+    _fields(plan, expected, "PLAN_INVALID", "experiment plan")
     try:
         validate_identity(plan)
     except InvocationError as exc:
         raise ContractError(exc.code, exc.message) from exc
     if version not in {"1.0", "2.0"}:
-        raise ContractError("PLAN_INVALID", "不支持此 schema_version")
+        raise ContractError("PLAN_INVALID", "Unsupported schema_version")
     model = plan["model"]
     if not isinstance(model, str) or model not in MODELS:
-        raise ContractError("UNSUPPORTED_MODEL", "model 不在 capabilities.json 的模型清单中")
+        raise ContractError("UNSUPPORTED_MODEL", "model must appear in the capabilities.json registry")
     if not isinstance(plan["params"], dict):
-        raise ContractError("PLAN_INVALID", "params 必须是对象")
+        raise ContractError("PLAN_INVALID", "params must be an object")
     try:
         resolved = normalize_params(model, plan["params"])
     except ValueError as exc:
         code = "UNSUPPORTED_PARAMETER" if "unsupported fields" in str(exc) else "PLAN_INVALID"
         raise ContractError(code, str(exc)) from exc
     if not _integer(plan["random_seed"], 0, 2**32 - 1):
-        raise ContractError("PLAN_INVALID", "random_seed 必须是 0 到 2**32-1 的整数")
+        raise ContractError("PLAN_INVALID", "random_seed must be an integer from 0 to 2**32 - 1")
     if not _integer(plan["timeout_seconds"], 1, MAX_TIMEOUT_SECONDS):
-        raise ContractError("PLAN_INVALID", "timeout_seconds 必须是 1 到 600 的整数")
+        raise ContractError("PLAN_INVALID", "timeout_seconds must be an integer from 1 to 600")
     normalized = {**plan, "params": resolved}
     if version == "2.0":
         representation = plan["representation"]
         if not isinstance(representation, str) or representation not in {
             "dense_numeric", "raw_text", "image_tensor"
         }:
-            raise ContractError("PLAN_INVALID", "representation 不受支持")
+            raise ContractError("PLAN_INVALID", "Unsupported representation")
         if representation not in MODELS[model].representations:
-            raise ContractError("UNSUPPORTED_MODEL", "模型不支持计划声明的 representation")
+            raise ContractError("UNSUPPORTED_MODEL", "The model does not support this plan representation")
         try:
             normalized["pipeline"] = normalize_pipeline(representation, plan["pipeline"])
+            validate_model_pipeline(model, normalized["pipeline"])
         except (TypeError, ValueError) as exc:
             raise ContractError("PLAN_INVALID", str(exc)) from exc
     return normalized
 
 
 def resolve_data_path(base_dir: str | Path, relative: Any) -> Path:
-    """文件位置只能位于清单目录内；不依赖当前工作目录。"""
+    """Resolve paths inside the manifest directory independently of the working directory."""
     if (
         not isinstance(relative, str)
         or not relative
@@ -212,20 +214,20 @@ def resolve_data_path(base_dir: str | Path, relative: Any) -> Path:
         or PureWindowsPath(relative).drive
         or ".." in PurePosixPath(relative).parts
     ):
-        raise ContractError("DATA_INVALID", "数据路径必须是包内的相对 POSIX 路径")
+        raise ContractError("DATA_INVALID", "The data file must use a relative POSIX path within its package")
     base = Path(base_dir).resolve()
     try:
         candidate = (base / relative).resolve()
         candidate.relative_to(base)
     except (OSError, ValueError, RuntimeError) as exc:
-        raise ContractError("DATA_INVALID", "数据文件路径越出数据包") from exc
+        raise ContractError("DATA_INVALID", "The file path escapes the data package") from exc
     if not candidate.is_file():
-        raise ContractError("DATA_INVALID", "清单指向的数据文件不存在或不是普通文件")
+        raise ContractError("DATA_INVALID", "The manifest entry must point to an existing regular file")
     return candidate
 
 
 def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[str, Any]:
-    """先检查元数据；数组内容在训练子进程内检查，计入时间限制。"""
+    """Validate metadata first. The worker validates array contents within its time limit."""
     manifest = read_json(manifest_path)
     required_v1 = {
         "schema_version",
@@ -244,16 +246,16 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
     required = required_v1 if version == "1.0" else required_v2 if version == "2.0" else set()
     _fields(manifest, required, "DATA_INVALID", "data_manifest")
     if version not in {"1.0", "2.0"}:
-        raise ContractError("DATA_INVALID", "数据清单 schema_version 不受支持")
+        raise ContractError("DATA_INVALID", "Unsupported data manifest schema_version")
     if plan["schema_version"] != version:
-        raise ContractError("DATA_INVALID", "Plan 与 data_manifest schema_version 必须匹配")
+        raise ContractError("DATA_INVALID", "The plan and data manifest schema versions must match")
     for field in ("task_id", "data_version"):
         if manifest[field] != plan[field]:
-            raise ContractError("DATA_INVALID", f"数据清单的 {field} 与计划不一致")
+            raise ContractError("DATA_INVALID", f"Manifest {field} does not match the plan")
     if manifest["problem_type"] != "classification":
-        raise ContractError("DATA_INVALID", "首版只支持 classification")
+        raise ContractError("DATA_INVALID", "Only classification is supported")
     if not _integer(manifest["n_features"], 1):
-        raise ContractError("DATA_INVALID", "n_features 必须是正整数")
+        raise ContractError("DATA_INVALID", "n_features must be a positive integer")
     names = manifest.get("feature_names")
     if version == "1.0" and (
         not isinstance(names, list)
@@ -261,31 +263,31 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
         or len(names) != manifest["n_features"]
         or len(set(names)) != len(names)
     ):
-        raise ContractError("DATA_INVALID", "feature_names 必须是与列数一致的非空唯一名称列表")
+        raise ContractError("DATA_INVALID", "feature_names must be nonempty and unique and match the column count")
     classes = manifest["classes"]
     if not isinstance(classes, list) or len(classes) < 2:
-        raise ContractError("DATA_INVALID", "classes 必须至少包含两个类别")
+        raise ContractError("DATA_INVALID", "classes must contain at least two classes")
     for index, item in enumerate(classes):
-        _fields(item, {"id", "name"}, "DATA_INVALID", "classes 条目")
+        _fields(item, {"id", "name"}, "DATA_INVALID", "classes entry")
         if type(item["id"]) is not int or item["id"] != index:
-            raise ContractError("DATA_INVALID", "classes 必须按 0..K-1 的连续整数 id 排列")
+            raise ContractError("DATA_INVALID", "classes must use consecutive IDs ordered from 0 to K-1")
         if not isinstance(item["name"], str) or not item["name"].strip():
-            raise ContractError("DATA_INVALID", "类别 name 必须是非空字符串")
+            raise ContractError("DATA_INVALID", "A class name must be a nonempty string")
     if len({item["name"] for item in classes}) != len(classes):
-        raise ContractError("DATA_INVALID", "类别 name 不能重复")
+        raise ContractError("DATA_INVALID", "Class names must be unique")
     if version == "2.0":
         representation = manifest["representation"]
         if not isinstance(representation, str) or representation not in {"raw_text", "image_tensor"}:
-            raise ContractError("DATA_INVALID", "Manifest 2.0 仅支持 raw_text/image_tensor")
+            raise ContractError("DATA_INVALID", "Manifest 2.0 supports raw_text and image_tensor")
         if plan.get("representation") != representation:
-            raise ContractError("DATA_INVALID", "计划与数据清单 representation 不一致")
+            raise ContractError("DATA_INVALID", "The plan and data manifest declare different representations")
         modality = manifest["modality"]
         if (
             not isinstance(modality, dict)
             or not isinstance(modality.get("kind"), str)
             or modality.get("kind") not in {"text", "image"}
         ):
-            raise ContractError("DATA_INVALID", "Manifest 2.0 modality 声明非法")
+            raise ContractError("DATA_INVALID", "The Manifest 2.0 modality declaration is invalid")
         if representation == "raw_text":
             if (
                 set(modality) != {"kind", "text_columns", "max_characters"}
@@ -297,10 +299,10 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
                 or manifest["n_features"] != len(modality["text_columns"])
                 or not _integer(modality.get("max_characters"), 1, 100_000)
             ):
-                raise ContractError("DATA_INVALID", "raw_text modality 与 n_features 不一致")
+                raise ContractError("DATA_INVALID", "The raw_text modality does not match n_features")
         else:
             if set(modality) != {"kind", "image_shape", "channel_layout", "value_range"}:
-                raise ContractError("DATA_INVALID", "image modality 字段不受支持")
+                raise ContractError("DATA_INVALID", "The image modality has unsupported fields")
             try:
                 from data_b.modality_readers import validate_image_spec
 
@@ -308,14 +310,14 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
                     modality["image_shape"], modality["channel_layout"], modality["value_range"]
                 )
             except (KeyError, ValueError) as exc:
-                raise ContractError("DATA_INVALID", "image modality 参数非法") from exc
+                raise ContractError("DATA_INVALID", "The image modality parameters are invalid") from exc
             if (
                 modality.get("kind") != "image"
                 or math.prod(shape) != manifest["n_features"]
                 or layout != modality["channel_layout"]
                 or list(value_range) != [float(item) for item in modality["value_range"]]
             ):
-                raise ContractError("DATA_INVALID", "image modality 与 n_features 不一致")
+                raise ContractError("DATA_INVALID", "The image modality does not match n_features")
     _fields(
         manifest["train"],
         {"features_path", "labels_path", "n_samples"},
@@ -327,14 +329,14 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
     base = Path(manifest_path).resolve().parent
     for split in ("train", "validation"):
         if not _integer(manifest[split]["n_samples"], 1):
-            raise ContractError("DATA_INVALID", f"{split}.n_samples 必须是正整数")
+            raise ContractError("DATA_INVALID", f"{split}.n_samples must be a positive integer")
         for key in ("features_path", "labels_path", "sample_ids_path"):
             if key in manifest[split]:
                 resolve_data_path(base, manifest[split][key])
     if manifest["preprocessor_path"] is not None:
         resolve_data_path(base, manifest["preprocessor_path"])
     if version == "2.0" and manifest["preprocessor_path"] is not None:
-        raise ContractError("DATA_INVALID", "Manifest 2.0 的拟合转换器必须由 C 的 Plan pipeline 管理")
+        raise ContractError("DATA_INVALID", "Manifest 2.0 must leave fitted transformers to the plan pipeline")
     return manifest
 
 
@@ -343,7 +345,7 @@ def read_sample_ids(path: str | Path, expected_count: int) -> list[str]:
         with Path(path).open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.reader(stream)
             if next(reader, None) != ["sample_id"]:
-                raise ContractError("DATA_INVALID", "valid_ids.csv 表头必须只有 sample_id")
+                raise ContractError("DATA_INVALID", "valid_ids.csv must have exactly one header, sample_id")
             ids = []
             for row in reader:
                 if (
@@ -351,12 +353,12 @@ def read_sample_ids(path: str | Path, expected_count: int) -> list[str]:
                     or not row[0].strip()
                     or any(character in row[0] for character in "\r\n\0")
                 ):
-                    raise ContractError("DATA_INVALID", "验证编号行必须是单列非空字符串")
+                    raise ContractError("DATA_INVALID", "Validation ID rows must contain one nonempty string")
                 ids.append(row[0])
     except (OSError, UnicodeError, csv.Error) as exc:
-        raise ContractError("DATA_INVALID", "无法读取验证样本编号 CSV") from exc
+        raise ContractError("DATA_INVALID", "Could not read the validation ID CSV") from exc
     if len(ids) != expected_count or len(set(ids)) != len(ids):
-        raise ContractError("DATA_INVALID", "验证编号重复，或行数与清单不符")
+        raise ContractError("DATA_INVALID", "Validation IDs contain duplicates or differ from the manifest row count")
     return ids
 
 
@@ -386,7 +388,7 @@ def _input_paths(manifest_path: str | Path, manifest: dict[str, Any]) -> dict[st
 
 
 def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> PreparedData:
-    """读取 B 的白名单输入，不打开 evaluation_manifest 或验证真实标签。"""
+    """Load the executor inputs and leave validation labels to the evaluator."""
     import numpy as np
     from data_b.npy_reader import read_npy_array
 
@@ -420,20 +422,20 @@ def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> Prepa
                 X_train = np.load(files["train_features"], allow_pickle=False)
                 X_valid = np.load(files["validation_features"], allow_pickle=False)
     except (OSError, ValueError, EOFError, TypeError) as exc:
-        raise ContractError("DATA_INVALID", "无法读取符合清单限制的训练/验证特征") from exc
+        raise ContractError("DATA_INVALID", "Could not read train or validation features matching the manifest") from exc
     for name, value, count in (
         ("X_train", X_train, manifest["train"]["n_samples"]),
         ("X_valid", X_valid, manifest["validation"]["n_samples"]),
     ):
         if not isinstance(value, np.ndarray):
-            raise ContractError("DATA_INVALID", f"{name} 必须是 .npy 数组")
+            raise ContractError("DATA_INVALID", f"{name} must be a .npy array")
         if representation == "dense_numeric":
             if value.ndim != 2 or value.shape != (count, manifest["n_features"]):
-                raise ContractError("DATA_INVALID", f"{name} 的 shape 与清单不一致")
+                raise ContractError("DATA_INVALID", f"{name} shape does not match the manifest")
             if value.dtype.kind != "f" or value.dtype.itemsize not in (4, 8):
-                raise ContractError("DATA_INVALID", f"{name} 必须是 float32 或 float64")
+                raise ContractError("DATA_INVALID", f"{name} must be float32 or float64")
             if not np.isfinite(value).all():
-                raise ContractError("DATA_INVALID", f"{name} 包含 NaN 或无穷值")
+                raise ContractError("DATA_INVALID", f"{name} contains NaN or infinity")
         elif representation == "raw_text":
             modality = manifest["modality"]
             if (
@@ -442,17 +444,17 @@ def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> Prepa
                 or value.dtype.kind != "O"
                 or any(type(item) is not str for item in value.flat)
             ):
-                raise ContractError("DATA_INVALID", f"{name} 文本 shape/dtype 与清单不一致")
+                raise ContractError("DATA_INVALID", f"{name} text shape or dtype differs from the manifest")
             if any(len(item) > modality["max_characters"] or "\0" in item for item in value.flat):
-                raise ContractError("DATA_INVALID", f"{name} 文本内容越过长度或字符限制")
+                raise ContractError("DATA_INVALID", f"{name} exceeds the text length or character limits")
         else:
             modality = manifest["modality"]
             expected = (count, *modality["image_shape"])
             if value.shape != expected or value.dtype.kind not in "fiu":
-                raise ContractError("DATA_INVALID", f"{name} 图像 shape/dtype 与清单不一致")
+                raise ContractError("DATA_INVALID", f"{name} image shape or dtype differs from the manifest")
             lower, upper = modality["value_range"]
             if not np.isfinite(value).all() or (value < lower).any() or (value > upper).any():
-                raise ContractError("DATA_INVALID", f"{name} 图像像素无效或超出声明范围")
+                raise ContractError("DATA_INVALID", f"{name} contains invalid image pixels or pixels outside the declared range")
     if (
         not isinstance(y_train, np.ndarray)
         or y_train.ndim != 1
@@ -460,14 +462,14 @@ def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> Prepa
         or y_train.dtype.kind != "i"
         or y_train.dtype.itemsize not in (4, 8)
     ):
-        raise ContractError("DATA_INVALID", "y_train 必须是与训练行数一致的 int32/int64 一维数组")
+        raise ContractError("DATA_INVALID", "y_train must be a one-dimensional int32 or int64 array matching the training row count")
     class_ids = [item["id"] for item in manifest["classes"]]
     if not np.array_equal(np.unique(y_train), np.asarray(class_ids)):
-        raise ContractError("DATA_INVALID", "训练标签必须恰好覆盖全部 0..K-1 类别")
+        raise ContractError("DATA_INVALID", "Training labels must cover exactly classes 0..K-1")
     sample_ids = read_sample_ids(files["validation_ids"], X_valid.shape[0])
     hashes = {name: sha256_file(path) for name, path in files.items()}
     if hashes != hashes_before:
-        raise ContractError("DATA_INVALID", "读取期间输入文件发生变化，请冻结数据版本后重试")
+        raise ContractError("DATA_INVALID", "Inputs changed while reading. Freeze a data version and retry.")
     return PreparedData(manifest, X_train, y_train, X_valid, sample_ids, class_ids, hashes)
 
 
@@ -477,36 +479,36 @@ def validate_prediction_file(
     sample_ids: list[str],
     class_ids: list[int],
 ) -> int:
-    """检查列含义、逐行样本对齐和概率，不计算任何评分。"""
+    """Validate probability columns, row alignment, and probability values."""
     expected_header = ["sample_id", "y_pred"] + [f"p_{item}" for item in class_ids]
     try:
         with Path(path).open(encoding="utf-8", newline="") as stream:
             reader = csv.reader(stream)
             if next(reader, None) != expected_header:
-                raise ContractError("ARTIFACT_INVALID", "预测文件表头或类别概率列顺序错误")
+                raise ContractError("ARTIFACT_INVALID", "The prediction header or probability column order is invalid")
             count = 0
             for row in reader:
                 if len(row) != len(expected_header) or count >= len(sample_ids):
-                    raise ContractError("ARTIFACT_INVALID", "预测文件的列数或行数错误")
+                    raise ContractError("ARTIFACT_INVALID", "The prediction column or row count is invalid")
                 if row[0] != sample_ids[count]:
-                    raise ContractError("ARTIFACT_INVALID", "预测样本编号与 B 的顺序不一致")
+                    raise ContractError("ARTIFACT_INVALID", "Prediction sample IDs differ from the prepared data order")
                 try:
                     label = int(row[1])
                     probabilities = [float(item) for item in row[2:]]
                 except (ValueError, OverflowError) as exc:
-                    raise ContractError("ARTIFACT_INVALID", "预测类别或概率不是合法数字") from exc
+                    raise ContractError("ARTIFACT_INVALID", "Predictions contain a nonnumeric class ID or probability") from exc
                 if str(label) != row[1] or label not in class_ids:
-                    raise ContractError("ARTIFACT_INVALID", "预测类别不在有效整数类别集合内")
+                    raise ContractError("ARTIFACT_INVALID", "Predictions contain a class ID outside the accepted integer IDs")
                 if (
                     not all(math.isfinite(item) and 0 <= item <= 1 for item in probabilities)
                     or abs(math.fsum(probabilities) - 1.0) > 1e-6
                 ):
-                    raise ContractError("ARTIFACT_INVALID", "预测概率范围、有限性或概率和不合法")
+                    raise ContractError("ARTIFACT_INVALID", "Prediction probabilities contain invalid values or row sums")
                 count += 1
     except (OSError, UnicodeError, csv.Error) as exc:
-        raise ContractError("ARTIFACT_INVALID", "无法读取完整的预测 CSV") from exc
+        raise ContractError("ARTIFACT_INVALID", "Could not read the full predictions CSV") from exc
     if count != len(sample_ids):
-        raise ContractError("ARTIFACT_INVALID", "预测行数不等于验证样本数")
+        raise ContractError("ARTIFACT_INVALID", "Prediction row count differs from the validation sample count")
     return count
 
 
@@ -515,14 +517,14 @@ def inspect_artifacts(
     manifest_path: str | Path,
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    """父执行器独立检查产物后，才允许发布 success。"""
+    """Verify the worker artifacts before publishing a successful result."""
     run_dir = Path(run_dir).resolve()
     for name in ("model.joblib", "predictions.csv", "worker_metadata.json"):
         file_path = run_dir / name
         if not file_path.is_file() or file_path.resolve().parent != run_dir:
-            raise ContractError("ARTIFACT_INVALID", "训练未生成完整的本实验产物")
+            raise ContractError("ARTIFACT_INVALID", "Training did not generate all experiment artifacts")
         if file_path.stat().st_size == 0:
-            raise ContractError("ARTIFACT_INVALID", "训练产物为空")
+            raise ContractError("ARTIFACT_INVALID", "A training artifact is empty")
     metadata = read_json(run_dir / "worker_metadata.json", error_code="ARTIFACT_INVALID")
     class_ids = [item["id"] for item in manifest["classes"]]
     if (
@@ -530,12 +532,12 @@ def inspect_artifacts(
         or not isinstance(metadata.get("class_ids"), list)
         or any(type(item) is not int for item in metadata["class_ids"])
     ):
-        raise ContractError("ARTIFACT_INVALID", "worker 类别映射与数据清单不一致")
+        raise ContractError("ARTIFACT_INVALID", "The worker class mapping differs from the data manifest")
     if (
         type(metadata.get("n_predictions")) is not int
         or metadata["n_predictions"] != manifest["validation"]["n_samples"]
     ):
-        raise ContractError("ARTIFACT_INVALID", "worker 预测行数与清单不一致")
+        raise ContractError("ARTIFACT_INVALID", "The worker prediction row count differs from the manifest")
     input_hashes = metadata.get("input_hashes")
     expected_hashes = {
         "manifest",
@@ -554,16 +556,16 @@ def inspect_artifacts(
             for value in input_hashes.values()
         )
     ):
-        raise ContractError("ARTIFACT_INVALID", "worker 缺少完整输入文件摘要")
+        raise ContractError("ARTIFACT_INVALID", "The worker lacks the full input file checksums")
     try:
         if read_json(manifest_path) != manifest:
-            raise ContractError("ARTIFACT_INVALID", "运行中数据清单描述发生变化")
+            raise ContractError("ARTIFACT_INVALID", "The data manifest description changed during the run")
         files = _input_paths(manifest_path, manifest)
         current_hashes = {name: sha256_file(path) for name, path in files.items()}
     except (ContractError, OSError) as exc:
-        raise ContractError("ARTIFACT_INVALID", "运行中输入文件失效，请检查冻结的数据版本") from exc
+        raise ContractError("ARTIFACT_INVALID", "An input became unavailable during the run. Check the frozen data version.") from exc
     if input_hashes != current_hashes:
-        raise ContractError("ARTIFACT_INVALID", "运行中输入文件发生变化，请使用新数据版本")
+        raise ContractError("ARTIFACT_INVALID", "An input changed during the run. Use a new data version.")
     ids_path = files["validation_ids"]
     ids = read_sample_ids(ids_path, manifest["validation"]["n_samples"])
     validate_prediction_file(run_dir / "predictions.csv", sample_ids=ids, class_ids=class_ids)

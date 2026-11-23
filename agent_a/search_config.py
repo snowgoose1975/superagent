@@ -23,9 +23,9 @@ SEARCH_FIELDS = {
 def load_search_config(path: str | Path) -> dict[str, Any]:
     value = read_json(path, error_code="PLAN_INVALID")
     if set(value) != SEARCH_FIELDS or value.get("schema_version") != "1.0":
-        raise ValueError("search config 字段或 schema_version 不受支持")
+        raise ValueError("Unsupported search config fields or schema_version")
     if type(value["require_family_coverage"]) is not bool:
-        raise ValueError("require_family_coverage 必须是布尔值")
+        raise ValueError("require_family_coverage must be a boolean")
     for field, low, high in (
         ("min_exploration_trials", 1, 100),
         ("patience", 1, 100),
@@ -35,17 +35,17 @@ def load_search_config(path: str | Path) -> dict[str, Any]:
     ):
         item = value[field]
         if type(item) is not int or not low <= item <= high:
-            raise ValueError(f"{field} 必须是 {low}–{high} 的整数")
+            raise ValueError(f"{field} must be an integer from {low} to {high}")
     if value["finalize_reserve_seconds"] >= value["max_session_seconds"]:
-        raise ValueError("finalize_reserve_seconds 必须小于 max_session_seconds")
+        raise ValueError("finalize_reserve_seconds must be less than max_session_seconds")
     delta = value["min_delta"]
     if type(delta) not in (int, float) or not 0 <= delta <= 1:
-        raise ValueError("min_delta 必须是 [0, 1] 内的有限数")
+        raise ValueError("min_delta must be finite and between 0 and 1")
     offsets = value["confirmation_seed_offsets"]
     if (
         not isinstance(offsets, list)
         or len(offsets) > 2
         or any(type(offset) is not int or not 1 <= offset <= 2**32 - 1 for offset in offsets)
     ):
-        raise ValueError("confirmation_seed_offsets 最多含两个正整数偏移")
+        raise ValueError("confirmation_seed_offsets accepts at most two positive integer offsets")
     return value

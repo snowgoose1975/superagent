@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 
 def _safe_id(value: str, field: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) or ".." in value:
-        raise ValueError(f"{field} 必须为 1–64 位英文字母、数字、下划线或连字符，且不能含 ..")
+        raise ValueError(f"{field} must contain 1–64 ASCII letters, digits, underscores, or hyphens and exclude '..'")
     return value
 
 
@@ -42,9 +42,9 @@ def make_demo(
     task_id = _safe_id(task_id or f"demo_{uuid.uuid4().hex[:12]}", "task_id")
     data_version = _safe_id(data_version, "data_version")
     if type(n_classes) is not int or n_classes not in (2, 3):
-        raise ValueError("n_classes 只支持 2 或 3")
+        raise ValueError("n_classes must be 2 or 3")
     if type(random_seed) is not int or not 0 <= random_seed <= 2**32 - 1:
-        raise ValueError("random_seed 必须在 0 到 2**32-1 之间")
+        raise ValueError("random_seed must be between 0 and 2**32 - 1")
 
     package = Path(data_root).expanduser().resolve() / task_id / data_version
     package.mkdir(parents=True, exist_ok=False)
@@ -124,7 +124,7 @@ def make_demo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="生成不含真实任务数据的 C 演示数据包")
+    parser = argparse.ArgumentParser(description="Generate a synthetic data package for the executor demo")
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--task-id")
     parser.add_argument("--n-classes", type=int, choices=(2, 3), default=2)

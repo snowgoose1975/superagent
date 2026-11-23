@@ -58,10 +58,10 @@ def _source_file(root: Path, relative: Any) -> Path:
     if (not isinstance(relative, str) or not relative or "\\" in relative
             or Path(relative).is_absolute() or ".." in Path(relative).parts
             or any(part.startswith(".") for part in Path(relative).parts)):
-        raise TaskDirectoryError("任务输入必须为任务目录内非隐藏的相对文件路径")
+        raise TaskDirectoryError("Task inputs must use visible relative paths within the task directory")
     path = (root / relative).resolve(strict=True)
     if not path.is_relative_to(root) or not path.is_file():
-        raise TaskDirectoryError(f"任务文件越出任务目录或不存在：{relative}")
+        raise TaskDirectoryError(f"Task file is missing or escapes the task directory: {relative}")
     return path
 
 
@@ -71,15 +71,15 @@ def _scalar(value: Any) -> Any:
         value = value.decode("utf-8", errors="strict")
     token = typed_category_token(value)
     if not isinstance(token, str):
-        raise TaskDirectoryError("分类标签不能包含缺失值")
+        raise TaskDirectoryError("Classification labels cannot be missing")
     if type(value) not in (str, int, float, bool):
-        raise TaskDirectoryError("分类标签必须是字符串、数字或布尔值")
+        raise TaskDirectoryError("Classification labels must be strings, numbers, or booleans")
     return value
 
 
 def _labels(values: np.ndarray) -> np.ndarray:
     if values.ndim != 1 or not 1 <= len(values) <= _MAX_ROWS:
-        raise TaskDirectoryError("分类标签必须是非空的一维数组")
+        raise TaskDirectoryError("Classification labels must be a non-empty one-dimensional array")
     return np.asarray([_scalar(value) for value in values], dtype=object)
 
 
@@ -87,7 +87,7 @@ def _label_schema(values: np.ndarray) -> tuple[list[Any], list[str]]:
     unique = {typed_category_token(value): value for value in values}
     labels = [unique[token] for token in sorted(unique)]
     if not 2 <= len(labels) <= 1024:
-        raise TaskDirectoryError("仅支持训练集具有 2–1024 个类别的分类任务")
+        raise TaskDirectoryError("Classification requires 2 to 1024 training classes")
     names = [str(value) for value in labels]
     if len(set(names)) != len(names):
         names = [f"{type(value).__name__}:{value}" for value in labels]
@@ -101,7 +101,7 @@ def _save_array(path: Path, values: np.ndarray) -> None:
 
 def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
     if path.stat().st_size > _MAX_CSV_BYTES:
-        raise TaskDirectoryError("CSV 超过 64 MiB 的读取上限")
+        raise TaskDirectoryError("CSV exceeds the 64 MiB input limit")
     rows: list[list[str]] = []
     total_characters = 0
     try:
@@ -110,21 +110,21 @@ def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
             header = next(reader, None)
             if (not header or len(header) > 4096 or len(set(header)) != len(header)
                     or any(not name.strip() or "\0" in name for name in header)):
-                raise TaskDirectoryError("CSV 必须有唯一非空列名表头")
+                raise TaskDirectoryError("CSV requires unique non-empty column names")
             for row in reader:
                 if (len(row) != len(header) or len(rows) >= _MAX_ROWS
                         or (len(rows) + 1) * len(header) > _MAX_ELEMENTS):
-                    raise TaskDirectoryError("CSV 行宽不匹配或行数/元素数超出上限")
+                    raise TaskDirectoryError("CSV row width is inconsistent or input exceeds row or element limits")
                 if any("\0" in value or len(value) > _MAX_FIELD_CHARACTERS for value in row):
-                    raise TaskDirectoryError("CSV 文本含 NUL 或单元格超过 100000 字符")
+                    raise TaskDirectoryError("CSV contains NUL or a cell exceeds 100000 characters")
                 total_characters += sum(map(len, row))
                 if total_characters > _MAX_TEXT_CHARACTERS:
-                    raise TaskDirectoryError("CSV 总字符数超过 8000000 上限")
+                    raise TaskDirectoryError("CSV exceeds the 8000000-character limit")
                 rows.append(row)
     except (OSError, UnicodeError, csv.Error) as exc:
-        raise TaskDirectoryError(f"CSV 无法安全读取：{path.name}") from exc
+        raise TaskDirectoryError(f"Unable to read CSV safely: {path.name}") from exc
     if not rows:
-        raise TaskDirectoryError("CSV 不能为空")
+        raise TaskDirectoryError("CSV cannot be empty")
     return header, rows
 
 
@@ -134,10 +134,10 @@ def _read_npy_matrix(root: Path, paths: list[str]) -> tuple[np.ndarray, list[int
         return arrays[0], [arrays[0].shape[1] if arrays[0].ndim == 2 else 1]
     if (any(array.ndim != 2 for array in arrays)
             or len({len(array) for array in arrays}) != 1):
-        raise TaskDirectoryError("混合 N/C 特征必须是行数一致的二维数组")
+        raise TaskDirectoryError("N/C features must be two-dimensional and have equal row counts")
     widths = [array.shape[1] for array in arrays]
     if sum(widths) > 4096 or len(arrays[0]) * sum(widths) > _MAX_ELEMENTS:
-        raise TaskDirectoryError("合并后的 N/C 特征超过维度上限")
+        raise TaskDirectoryError("Combined N/C features exceed the dimension limit")
     output = np.empty((len(arrays[0]), sum(widths)), dtype=object)
     offset = 0
     for array, width in zip(arrays, widths, strict=True):
@@ -160,7 +160,7 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
             break
     if explicit is not None:
         if not isinstance(explicit, str) or explicit.strip().lower() not in aliases:
-            raise TaskDirectoryError(f"info.json 指定了不支持的指标：{explicit!r}")
+            raise TaskDirectoryError(f"info.json declares an unsupported metric: {explicit!r}")
         name, source = aliases[explicit.strip().lower()], "info.json"
     else:
         text = re.sub(r"[*`]", "", readme.lower())
@@ -173,7 +173,7 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
             fragment = re.sub(r"^(?:(?:the|test|validation|set)\s+)+", "", fragment.strip())
             match = re.match(named_pattern, fragment)
             if not match:
-                raise TaskDirectoryError(f"README 指定了不支持的主指标：{fragment[:60]!r}")
+                raise TaskDirectoryError(f"README declares an unsupported metric: {fragment[:60]!r}")
             raw = re.sub(r"[ _-]+", " ", match.group(0))
             normal = {"macro f1": "f1_macro", "f1 macro": "f1_macro",
                       "log loss": "log_loss", "cross entropy": "log_loss"}
@@ -189,7 +189,7 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
         if declarations:
             declared = {declared_name(fragment) for fragment in declarations}
             if len(declared) != 1:
-                raise TaskDirectoryError("README 中存在冲突的主指标声明")
+                raise TaskDirectoryError("README contains conflicting primary metrics")
             name = declared.pop()
             return {"name": name, "greater_is_better": name != "log_loss"}, "README_primary" if primary else "README_test_report"
         found = set()
@@ -199,11 +199,11 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
             if re.search(pattern, text):
                 found.add(name)
         if len(found) > 1:
-            raise TaskDirectoryError("README 中出现多个支持指标，无法唯一确定主指标")
+            raise TaskDirectoryError("README does not identify one primary metric")
         if found:
             name, source = found.pop(), "README"
         elif re.search(r"\b(?:auc|roc_auc|rmse|mae|mse|precision|recall|f1|r2)\b", text):
-            raise TaskDirectoryError("README 指定的指标尚不支持；当前支持 accuracy/f1_macro/log_loss")
+            raise TaskDirectoryError("Unsupported README metric. Use accuracy, f1_macro, or log_loss")
         else:
             name, source = "accuracy", "default_unspecified"
     return {"name": name, "greater_is_better": name != "log_loss"}, source
@@ -215,7 +215,7 @@ def _declared_columns(info: dict[str, Any], readme: str, width: int) -> list[str
         if isinstance(columns, list):
             if (len(columns) != width or len(set(columns)) != width
                     or any(not isinstance(name, str) or not name.strip() for name in columns)):
-                raise TaskDirectoryError(f"info.json 的 {field} 与训练特征列数不匹配")
+                raise TaskDirectoryError(f"info.json {field} does not match the training feature count")
             return list(columns)
     match = re.search(r"columns[^\n]*?from left to right[^\n]*?\b(?:are|:)\s*(.+)",
                       readme, flags=re.IGNORECASE)
@@ -223,7 +223,7 @@ def _declared_columns(info: dict[str, Any], readme: str, width: int) -> list[str
         columns = re.findall(r"`([^`]+)`", match.group(1))
         if columns:
             if len(columns) != width or len(set(columns)) != width:
-                raise TaskDirectoryError("README 声明的顺序列名与训练特征宽度不一致")
+                raise TaskDirectoryError("README column order does not match the training feature width")
             return columns
     return None
 
@@ -235,7 +235,7 @@ def _target_column(info: dict[str, Any], readme: str, columns: list[str]) -> str
             value = info[field]
             value = value.get("name") if isinstance(value, dict) else value
             if not isinstance(value, str):
-                raise TaskDirectoryError(f"info.json 的 {field} 必须是目标列名")
+                raise TaskDirectoryError(f"info.json {field} must identify the target column")
             declarations.append(value)
     declarations.extend(re.findall(
         r"\b(?:target|label|response)(?:\s+column)?\s*(?:is|:|=)?\s*[`\"']([^`\"']+)[`\"']",
@@ -243,11 +243,11 @@ def _target_column(info: dict[str, Any], readme: str, columns: list[str]) -> str
     declarations = list(dict.fromkeys(declarations))
     if declarations:
         if len(declarations) != 1 or declarations[0] not in columns:
-            raise TaskDirectoryError("README/info 目标列声明不唯一或不在 CSV 表头内")
+            raise TaskDirectoryError("The README or info.json target is ambiguous or absent from the CSV")
         return declarations[0]
     candidates = [name for name in columns if name.casefold() in {"label", "labels", "target", "y"}]
     if len(candidates) != 1:
-        raise TaskDirectoryError("CSV 未声明唯一目标列；需要 README target `列名` 或 info target_column")
+        raise TaskDirectoryError("CSV requires one target column declared in README or info.json")
     return candidates[0]
 
 
@@ -256,12 +256,12 @@ def _id_columns(info: dict[str, Any], readme: str, columns: list[str], target: s
     if isinstance(declared, str):
         declared = [declared]
     if not isinstance(declared, list) or any(not isinstance(value, str) for value in declared):
-        raise TaskDirectoryError("info id_column/id_columns 必须为列名或列名列表")
+        raise TaskDirectoryError("info id_column or id_columns must name one or more columns")
     declared = [*declared, *re.findall(
         r"\b(?:id|identifier)(?:\s+column)?\s*(?:is|:|=)?\s*`([^`]+)`",
         readme, flags=re.IGNORECASE)]
     if any(name not in columns or name == target for name in declared):
-        raise TaskDirectoryError("声明的 ID 列不存在或与目标列重复")
+        raise TaskDirectoryError("A declared ID column is missing or overlaps the target")
     return [name for name in columns if name != target and (
         name in declared or name.casefold() in {"id", "sample_id", "row_id", "index"})]
 
@@ -277,10 +277,10 @@ def _csv_input_columns(
             if (not isinstance(names, list) or not names
                     or any(not isinstance(name, str) or not name.strip() for name in names)
                     or len(names) != len(set(names))):
-                raise TaskDirectoryError(f"info.json 的 {field} 必须是唯一非空输入列名列表")
+                raise TaskDirectoryError(f"info.json {field} must list unique non-empty input columns")
             metadata.append(list(names))
     if len(metadata) > 1 and metadata[0] != metadata[1]:
-        raise TaskDirectoryError("info.json 的输入列声明互相冲突")
+        raise TaskDirectoryError("info.json contains conflicting input column declarations")
     statements = re.findall(
         r"\buse\s+((?:`[^`]+`|[^`\n.;])+?)\s+as\s+(?:the\s+)?(?:inputs?|(?:input\s+)?features)\b",
         readme, flags=re.IGNORECASE)
@@ -293,19 +293,19 @@ def _csv_input_columns(
         if all(re.search(r"\.(?:csv|npy|json|txt|parquet)$", name, flags=re.IGNORECASE) for name in names):
             continue
         if len(names) != len(set(names)):
-            raise TaskDirectoryError("README 的输入列声明包含重复列")
+            raise TaskDirectoryError("README lists duplicate input columns")
         declarations.append(names)
     declared = [*metadata, *declarations]
     for names in declared:
         if target in names:
-            raise TaskDirectoryError("目标标签列不能作为输入特征")
+            raise TaskDirectoryError("The target label cannot be used as an input feature")
         if any(name not in header or name in ids for name in names):
-            raise TaskDirectoryError("声明的输入特征不在 CSV 表头内或与 ID 列重复")
+            raise TaskDirectoryError("A declared input feature is absent from the CSV or overlaps an ID")
     if declared and any(set(names) != set(declared[0]) for names in declared[1:]):
-        raise TaskDirectoryError("README/info 的输入列声明互相冲突")
+        raise TaskDirectoryError("README and info.json disagree on input columns")
     columns = declared[0] if declared else [name for name in header if name != target and name not in ids]
     if not columns:
-        raise TaskDirectoryError("排除目标/ID 后没有输入特征")
+        raise TaskDirectoryError("No features remain after excluding target and ID columns")
     ignored = [name for name in header if name not in columns and name != target and name not in ids]
     return columns, ignored
 
@@ -351,7 +351,7 @@ def _text_matrix(values: np.ndarray) -> np.ndarray:
     if values.ndim == 1:
         values = values.reshape(-1, 1)
     if values.ndim != 2 or not 1 <= values.shape[1] <= 8:
-        raise TaskDirectoryError("文本任务支持 1–8 个输入列")
+        raise TaskDirectoryError("Text tasks support 1 to 8 input columns")
     output = np.empty(values.shape, dtype=object)
     total = 0
     for index, value in np.ndenumerate(values):
@@ -359,10 +359,10 @@ def _text_matrix(values: np.ndarray) -> np.ndarray:
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="strict")
         if not isinstance(value, str) or "\0" in value or len(value) > _MAX_FIELD_CHARACTERS:
-            raise TaskDirectoryError("文本输入必须为合法字符串且每格不超过 100000 字符")
+            raise TaskDirectoryError("Text cells must be valid strings with at most 100000 characters")
         total += len(value)
         if total > _MAX_TEXT_CHARACTERS:
-            raise TaskDirectoryError("文本分区总字符数超过 8000000 上限")
+            raise TaskDirectoryError("Text partition exceeds the 8000000-character limit")
         output[index] = value
     return output
 
@@ -372,7 +372,7 @@ def _column_kinds(columns: list[str], values: dict[str, list], info: dict) -> di
     if declared is not None:
         if (not isinstance(declared, dict) or set(declared) != set(columns)
                 or any(kind not in {"numeric", "categorical", "text"} for kind in declared.values())):
-            raise TaskDirectoryError("info feature_types 必须覆盖全部输入列，类型为 numeric/categorical/text")
+            raise TaskDirectoryError("info feature_types must cover all inputs with numeric, categorical, or text")
         return dict(declared)
     return {name: ("numeric" if _numeric_values(values[name]) is not None else
                    "text" if _is_text_column(name, values[name]) else "categorical") for name in columns}
@@ -384,12 +384,12 @@ def _csv_sample_rows(header: list[str], rows: list[list[str]], reader: dict, sou
     for i, row in enumerate(rows):
         parts = [row[index] for index in indices]
         if any(not value.strip() or any(c in value for c in "\r\n\0") for value in parts):
-            raise TaskDirectoryError("原始样本 ID 必须非空且不含换行/NUL")
+            raise TaskDirectoryError("Source sample IDs must be non-empty and contain no newline or NUL")
         original = parts[0] if len(parts) == 1 else json.dumps(parts, ensure_ascii=False, separators=(",", ":")) if parts else ""
         output.append({"sample_id": original if parts else f"{split}_{i:09d}",
                        "original_id": original, "source_file": source, "source_row": str(i)})
     if len({row["sample_id"] for row in output}) != len(output):
-        raise TaskDirectoryError("同一分区的原始样本 ID 重复；不能唯一追踪样本")
+        raise TaskDirectoryError("Duplicate source sample IDs prevent unambiguous tracing")
     return output
 
 
@@ -404,7 +404,7 @@ def _csv_arrays(header: list[str], rows: list[list[str]], reader: dict[str, Any]
     expected = [*reader["feature_columns"], reader["target_column"], *reader["id_columns"],
                 *reader.get("ignored_columns", [])]
     if set(header) != set(expected):
-        raise TaskDirectoryError("CSV 列集合与训练时发现的特征/标签/ID 不一致")
+        raise TaskDirectoryError("CSV columns differ from the discovered features, labels, or IDs")
     indices = [header.index(name) for name in reader["feature_columns"]]
     values = np.asarray([[row[index] for index in indices] for row in rows], dtype=object)
     labels = _labels(np.asarray([row[header.index(reader["target_column"])] for row in rows], dtype=object))
@@ -415,7 +415,7 @@ def _csv_arrays(header: list[str], rows: list[list[str]], reader: dict[str, Any]
         if reader["feature_types"][name] == "numeric":
             converted = _numeric_values(raw)
             if converted is None and any(value.strip().casefold() not in _MISSING for value in raw):
-                raise TaskDirectoryError(f"数值 CSV 列 {name!r} 含非数值内容")
+                raise TaskDirectoryError(f"Numeric CSV column {name!r} contains non-numeric values")
             if reader.get("preserve_feature_lexemes", False):
                 values[:, column_index] = [None if value.strip().casefold() in _MISSING else value for value in raw]
             else:
@@ -429,12 +429,12 @@ def _csv_arrays(header: list[str], rows: list[list[str]], reader: dict[str, Any]
 
 def _image_modality(values: np.ndarray) -> dict[str, Any]:
     if values.ndim not in (3, 4) or values.dtype.kind not in "fiu" or not np.isfinite(values).all():
-        raise TaskDirectoryError("图像 NPY 必须是有限数值的 (N,H,W[,C]) 数组")
+        raise TaskDirectoryError("Image NPY must be a finite numeric (N,H,W[,C]) array")
     shape = list(values.shape[1:])
     if any(not 1 <= size <= 4096 for size in shape) or math.prod(shape) > 1_000_000:
-        raise TaskDirectoryError("单张图像尺寸超过支持上限")
+        raise TaskDirectoryError("Image dimensions exceed the supported limit")
     if len(shape) == 3 and shape[-1] not in (1, 3, 4):
-        raise TaskDirectoryError("图像只支持 HW/HWC，无法自动识别当前通道布局")
+        raise TaskDirectoryError("Image arrays must use HW or HWC channel layout")
     low, high = float(np.min(values)), float(np.max(values))
     if values.dtype == np.uint8:
         limits = [0.0, 255.0]
@@ -459,12 +459,12 @@ def _npy_features(values: np.ndarray, reader: dict[str, Any]) -> np.ndarray:
                 or values.dtype.kind not in "fiu" or not np.isfinite(values).all()
                 or (values < modality["value_range"][0]).any()
                 or (values > modality["value_range"][1]).any()):
-            raise TaskDirectoryError("图像特征与训练阶段发现的 shape/range 不一致")
+            raise TaskDirectoryError("Image shape or range does not match the training schema")
         return values
     if values.ndim == 1:
         values = values.reshape(-1, 1)
     if values.ndim != 2 or values.shape[1] != len(reader["feature_columns"]):
-        raise TaskDirectoryError("特征数组列数与训练阶段发现的 schema 不一致")
+        raise TaskDirectoryError("Feature width does not match the training schema")
     output = values.astype(object)
     for index, name in enumerate(reader["feature_columns"]):
         if reader["feature_types"][name] == "numeric":
@@ -474,13 +474,13 @@ def _npy_features(values: np.ndarray, reader: dict[str, Any]) -> np.ndarray:
                 present = [value for value in output[:, index]
                            if value is not None and not (isinstance(value, float) and math.isnan(value))]
                 if present:
-                    raise TaskDirectoryError(f"数值 NPY 列 {name!r} 含非数值内容")
+                    raise TaskDirectoryError(f"Numeric NPY column {name!r} contains non-numeric values")
                 converted = [None] * len(output)
             output[:, index] = converted
         elif reader["feature_types"][name] == "text":
             for value in output[:, index]:
                 if not isinstance(value, str) or "\0" in value or len(value) > _MAX_FIELD_CHARACTERS:
-                    raise TaskDirectoryError(f"文本 NPY 列 {name!r} 必须为受限字符串")
+                    raise TaskDirectoryError(f"Text NPY column {name!r} must contain bounded strings")
         else:
             for value in output[:, index]:
                 typed_category_token(value)
@@ -495,7 +495,7 @@ def _inventory(root: Path) -> dict[str, str]:
         # Only names are needed for test discovery; its contents/header are unread.
         key = path.name.casefold()
         if key in inventory:
-            raise TaskDirectoryError("任务目录存在大小写不区分的重名文件")
+            raise TaskDirectoryError("The task directory contains case-insensitive filename collisions")
         inventory[key] = path.name
     return inventory
 
@@ -506,7 +506,7 @@ def _pick_split_files(inventory: dict[str, str], extension: str, prefix: str = "
         name = f"{prefix}{alias}.{extension}".casefold()
         if name in inventory:
             if split in found:
-                raise TaskDirectoryError(f"{split} 分区存在多个别名文件，无法唯一选择")
+                raise TaskDirectoryError(f"Multiple candidate files match the {split} split")
             found[split] = inventory[name]
     return found
 
@@ -523,7 +523,7 @@ def _holdout_train(
     for token in sorted(groups):
         indices = np.asarray(groups[token], dtype=int)
         if len(indices) < 2:
-            raise TaskDirectoryError("未提供 validation，且至少一个类别少于 2 条训练行，无法分层留出")
+            raise TaskDirectoryError("A stratified holdout requires at least two training samples per class")
         rng.shuffle(indices)
         n_valid = max(1, min(len(indices) - 1, round(len(indices) * 0.2)))
         valid_indices.extend(indices[:n_valid])
@@ -548,7 +548,22 @@ def _check_declared_metadata(
                         n_cat_features=counts.count("categorical"))
     for field, actual in expected.items():
         if field in info and (type(info[field]) is not int or info[field] != actual):
-            raise TaskDirectoryError(f"info.json 的 {field}={info[field]!r} 与训练/验证实际值 {actual} 不一致")
+            raise TaskDirectoryError(f"info.json {field}={info[field]!r} disagrees with the observed value {actual}")
+
+
+def _describes_pairwise_preference(text: str) -> bool:
+    """Require complementary label meanings rather than relying on the target name."""
+    text = re.sub(r"[`*#]", "", text.lower())
+    if not re.search(r"\b(higher|lower|better|worse|wins?|won|preferred|winner)\b", text):
+        return False
+    roles = r"(?:(?:the|option|headline|text)\s+){0,2}(a|left|first|b|right|second)\b"
+    positive = re.search(r"\b(?:1|true)\s+(?:if|when|means)\s+" + roles, text)
+    negative = re.search(r"\b(?:0|false)\s+(?:if|when|means)\s+" + roles, text)
+    first = {"a", "left", "first"}
+    return (
+        positive is not None and negative is not None
+        and (positive.group(1) in first) != (negative.group(1) in first)
+    )
 
 
 def discover_task_directory(
@@ -563,17 +578,17 @@ def discover_task_directory(
     """Discover train/validation, stage immutable inputs, and defer all test reads."""
     root = Path(task_dir).expanduser().resolve(strict=True)
     if not root.is_dir():
-        raise TaskDirectoryError("任务路径必须是目录")
+        raise TaskDirectoryError("The task path must be a directory")
     destination = Path(workspace_dir).expanduser().resolve()
     if destination.is_relative_to(root):
-        raise TaskDirectoryError("任务 staging 目录必须在原始任务目录之外，以保留来源只读")
+        raise TaskDirectoryError("Staging must be outside the read-only task directory")
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
-        raise TaskDirectoryError("任务输入 staging 目录必须为空；保留已有内容")
-    if (type(max_trials) is not int or not 1 <= max_trials <= 20
+        raise TaskDirectoryError("Task staging must be empty")
+    if (type(max_trials) is not int or max_trials < 1
             or type(random_seed) is not int or not 0 <= random_seed <= 2**32 - 1
             or type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600):
-        raise TaskDirectoryError("训练轮数/种子/超时超出支持范围")
+        raise TaskDirectoryError("Trial count, seed, or timeout is outside the supported range")
     inventory = _inventory(root) if resolution is None else resolution["inventory"]
     hashes: dict[str, str] = {}
     readme = ""
@@ -581,25 +596,25 @@ def discover_task_directory(
     readmes = [value for key, value in inventory.items()
                if re.fullmatch(r"readme(?:\.(?:md|txt|rst))?", key)]
     if len(readmes) > 1:
-        raise TaskDirectoryError("存在多个 README，无法唯一选择任务说明")
+        raise TaskDirectoryError("Multiple README files make the task instructions ambiguous")
     metadata_files = ([*readmes, *([inventory["info.json"]] if "info.json" in inventory else [])]
                       if resolution is None else list(resolution["documents"]))
     for relative in metadata_files:
         path = _source_file(root, relative)
         if path.stat().st_size > 128 * 1024:
-            raise TaskDirectoryError("任务说明/info.json 超过 128 KiB 上限")
+            raise TaskDirectoryError("Task instructions or info.json exceed 128 KiB")
         hashes[relative] = _sha256(path)
         text = path.read_text(encoding="utf-8-sig")
         if resolution is None and relative.casefold() == "info.json":
             info = json.loads(text)
             if not isinstance(info, dict):
-                raise TaskDirectoryError("info.json 必须为对象")
+                raise TaskDirectoryError("info.json must be an object")
         else:
             readme += text + "\n\n"
     if resolution is not None:
         info = dict(resolution["metadata"])
     if str(info.get("task_type", "classification")).lower() in {"regression", "reg", "continuous"}:
-        raise TaskDirectoryError("当前自动接入支持分类任务，info 声明为回归任务")
+        raise TaskDirectoryError("Automatic discovery supports classification. info.json declares regression")
     metric, metric_source = _metric(info, readme)
     csv_files = _pick_split_files(inventory, "csv")
     feature_families = {prefix: _pick_split_files(inventory, "npy", f"{prefix}_")
@@ -609,26 +624,26 @@ def discover_task_directory(
     split_files: dict[str, dict[str, Any]] = {}
     if csv_files:
         if feature_families or "train" not in csv_files:
-            raise TaskDirectoryError("CSV 任务需要唯一 train.csv，可选 validation/test，且不能混有 NPY 特征分区")
+            raise TaskDirectoryError("CSV tasks require a unique train.csv and cannot include NPY feature splits")
         reader = {"format": "csv", "output_kind": "table"}
         if resolution is not None:
             reader["preserve_feature_lexemes"] = True
         split_files = {split: {"csv_path": path} for split, path in csv_files.items()}
     else:
         if not feature_families:
-            raise TaskDirectoryError("不支持的任务格式；支持 N/C/X_train.npy 或 train/val/test.csv")
+            raise TaskDirectoryError("Unsupported task format. Use N/C/X_train.npy or train/val/test.csv")
         prefixes = [prefix for prefix in ("n", "c", "x", "features", "text", "images") if prefix in feature_families]
         if len(prefixes) > 1 and set(prefixes) != {"n", "c"}:
-            raise TaskDirectoryError("NPY 特征来源不唯一；仅 N+C 可自动合并")
+            raise TaskDirectoryError("NPY features are ambiguous. Only N+C arrays can be combined automatically")
         split_names = set(feature_families[prefixes[0]])
         if ("train" not in split_names
                 or any(set(feature_families[prefix]) != split_names for prefix in prefixes)):
-            raise TaskDirectoryError("NPY 任务需要各特征一致的 train 分区，可选 validation/test")
+            raise TaskDirectoryError("NPY feature arrays require matching training and optional validation/test splits")
         label_families = [_pick_split_files(inventory, "npy", f"{prefix}_")
                           for prefix in ("y", "label", "labels", "target")]
         label_families = [files for files in label_families if files]
         if len(label_families) != 1 or set(label_families[0]) != split_names:
-            raise TaskDirectoryError("NPY 任务需要与特征分区一致的唯一 y/label 标签分区")
+            raise TaskDirectoryError("NPY features require a unique matching y/label split")
         reader = {"format": "npy", "feature_prefixes": prefixes, "output_kind": "table"}
         split_files = {split: {"feature_paths": [feature_families[prefix][split] for prefix in prefixes],
                                "labels_path": label_families[0][split]}
@@ -662,16 +677,16 @@ def discover_task_directory(
     else:
         train_X, widths = _read_npy_matrix(root, split_files["train"]["feature_paths"])
         if not 1 <= len(train_X) <= _MAX_ROWS:
-            raise TaskDirectoryError("训练特征不能为空或超过行数上限")
+            raise TaskDirectoryError("Training features are empty or exceed the row limit")
         if train_X.ndim in (3, 4):
             if len(reader["feature_prefixes"]) != 1:
-                raise TaskDirectoryError("图像不能混合多个特征来源")
+                raise TaskDirectoryError("Image tasks cannot combine feature sources")
             reader.update(output_kind="image", modality=_image_modality(train_X), feature_columns=[])
         else:
             if train_X.ndim == 1:
                 train_X = train_X.reshape(-1, 1)
             if train_X.ndim != 2 or not 1 <= train_X.shape[1] <= 4096:
-                raise TaskDirectoryError("表格/文本特征必须为非空二维数组")
+                raise TaskDirectoryError("Table and text inputs must be non-empty and two-dimensional")
             columns = _declared_columns(info, readme, train_X.shape[1])
             if columns is None:
                 columns = [f"{prefix}_{index}" for prefix, width in zip(reader["feature_prefixes"], widths, strict=True)
@@ -697,7 +712,7 @@ def discover_task_directory(
             valid_y = _labels(read_npy_array(_source_file(root, split_files["validation"]["labels_path"])))
             valid_index = _array_sample_rows(len(valid_y), split_files["validation"], "validation")
     if len(train_X) != len(train_y):
-        raise TaskDirectoryError("训练特征与标签行数不一致")
+        raise TaskDirectoryError("Training features and labels have different row counts")
     n_source_train = len(train_y)
     split_strategy: dict[str, Any] = {"kind": "provided_validation"}
     if "validation" not in split_files:
@@ -708,13 +723,13 @@ def discover_task_directory(
         valid_index = [source_index[i] for i in valid_rows]
         split_strategy = {"kind": "stratified_train_holdout", "fraction": 0.2, "random_seed": random_seed}
     if len(valid_X) != len(valid_y):
-        raise TaskDirectoryError("训练/验证特征与标签行数不一致")
+        raise TaskDirectoryError("Training or validation features and labels have different row counts")
     label_values, label_names = _label_schema(train_y)
     _check_declared_metadata(info, reader, n_source_train=n_source_train,
                              n_validation=len(valid_y), n_classes=len(label_values))
     for relative, digest in hashes.items():
         if _sha256(_source_file(root, relative)) != digest:
-            raise TaskDirectoryError("训练/验证/说明文件在发现期间发生变化")
+            raise TaskDirectoryError("Development data or instructions changed during discovery")
     code_hash = _sha256(Path(__file__))
     train_policy = {"max_trials": max_trials, "random_seed": random_seed,
                     "timeout_seconds": timeout_seconds}
@@ -753,7 +768,7 @@ def discover_task_directory(
                                      "n_samples": len(y), "sample_ids_path": index_name}
     declared_test_size = info.get("test_size", info.get("n_test"))
     if declared_test_size is not None and (type(declared_test_size) is not int or declared_test_size < 1):
-        raise TaskDirectoryError("info.json 声明的 test_size 必须为正整数")
+        raise TaskDirectoryError("info.json test_size must be a positive integer")
     descriptor_path = None
     if "test" in split_files:
         descriptor = {"schema_version": "2.0", "kind": "task_directory", "task_id": task_id,
@@ -781,6 +796,14 @@ def discover_task_directory(
                        label_semantics={"values": label_values[:32], "description": "Training label schema"})
     if "target_column" in reader:
         context["target_column"] = reader["target_column"]
+    if reader["output_kind"] == "text" and len(reader["feature_columns"]) == len(label_values) == 2:
+        task_description = (
+            readme if resolution is None else "\n".join(resolution["documents"].values())
+        )
+        context["pairwise_preference"] = (
+            info.get("pairwise_preference") is True
+            or _describes_pairwise_preference(task_description)
+        )
     train_files = split_files["train"]
     train_relatives = [train_files["csv_path"]] if reader["format"] == "csv" else [*train_files["feature_paths"], train_files["labels_path"]]
     report = {"schema_version": "1.0", "task_id": task_id, "data_version": version,
@@ -807,22 +830,22 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
     descriptor = json.loads(descriptor_file.read_text(encoding="utf-8"))
     if (not isinstance(descriptor, dict) or descriptor.get("schema_version") != "2.0"
             or descriptor.get("kind") != "task_directory"):
-        raise TaskDirectoryError("不支持的自动任务 test descriptor")
+        raise TaskDirectoryError("Unsupported automatic test descriptor")
     if descriptor.get("reader_code_sha256") != _sha256(Path(__file__)):
-        raise TaskDirectoryError("任务解析代码已变化；保留原 descriptor 并重新发现任务")
+        raise TaskDirectoryError("Task reader changed. Preserve the old descriptor and rediscover the task")
     root = Path(descriptor["source_root"]).expanduser().resolve(strict=True)
     if not root.is_dir():
-        raise TaskDirectoryError("test descriptor 的 source_root 必须为目录")
+        raise TaskDirectoryError("The test descriptor source_root must be a directory")
     destination = Path(output_dir).expanduser().resolve()
     if destination.is_relative_to(root):
-        raise TaskDirectoryError("最终 test staging 目录必须在原始任务目录之外")
+        raise TaskDirectoryError("Final test staging must be outside the task directory")
     reader, files = descriptor["reader"], descriptor["test_files"]
     if reader.get("format") == "csv":
         relatives = [files["csv_path"]]
     elif reader.get("format") == "npy":
         relatives = [*files["feature_paths"], files["labels_path"]]
     else:
-        raise TaskDirectoryError("test descriptor reader 格式不支持")
+        raise TaskDirectoryError("Unsupported test descriptor reader")
     before = {name: _sha256(_source_file(root, name)) for name in relatives}
     if reader["format"] == "csv":
         header, rows = _read_csv(_source_file(root, files["csv_path"]))
@@ -834,13 +857,13 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
         y = _labels(read_npy_array(_source_file(root, files["labels_path"])))
         sample_rows = _array_sample_rows(len(y), files, "test")
     if len(X) != len(y):
-        raise TaskDirectoryError("test 特征与标签行数不一致")
+        raise TaskDirectoryError("Test features and labels have different row counts")
     declared = descriptor.get("n_samples")
     if declared is not None and declared != len(y):
-        raise TaskDirectoryError("test 实际行数与任务说明声明的 test_size 不一致")
+        raise TaskDirectoryError("Test row count differs from the declared test_size")
     after = {name: _sha256(_source_file(root, name)) for name in relatives}
     if before != after or _sha256(descriptor_file) != descriptor_hash:
-        raise TaskDirectoryError("test 输入或 descriptor 在物化期间发生变化")
+        raise TaskDirectoryError("Test input or descriptor changed during materialization")
     destination.mkdir(parents=True, exist_ok=True)
     _save_array(destination / "X_test.npy", X)
     _save_array(destination / "y_test.npy", y)
