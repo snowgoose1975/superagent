@@ -2,6 +2,8 @@
 
 SuperAgent prepares classification data, searches registered models, and freezes the validation winner before evaluating the test split. It supports tabular, text, and image-array tasks.
 
+B also supports TSV, line-based text, text/image class directories, and image-path CSVs. Optional LLM analysis identifies file roles and data types; program readers handle loading and bounded conversion of flat JSON records/custom delimiters. Images retain their native dimensions, including every RGB pixel in mixed inputs. Samples with missing text or image references are removed with aligned labels and an audit report; numeric missing values retain imputation. Nested JSON and external JSONL are unsupported. Existing A/C interfaces are retained. See [B input readers and conversion](docs/b-readers-and-conversion.md) for layouts, limits, and frozen raw-input prediction.
+
 ## Run in Linux or WSL
 
 ```bash

@@ -4,7 +4,7 @@
 
 - 项目用于阅读四人模块如何连接。B/C 为实际数据准备与训练实现；A 接入同学包的规则规划和可选 LLM 规划；D 真实计算 accuracy，新增显式学校 API 网关。默认离线。用户指定学校模式从本项目根 `.env` 加载 `SCHOOL_API_KEY`，真实 `.env` 由用户自行创建，Codex 不写入或读取真实 key、不继续 TLS 排查。
 - `main.py` 是集成入口，`predict.py` 是冻结后新特征预测入口。
-- B 的显式 `--b-analysis llm` 在解析前复用 D 网关和持久任务预算（要求稳定 task-budget-id），声明式解析任意命名 CSV/NPY、解释训练质量并提出受校验的预处理配置。`data_b/llm_analysis.py` 不执行生成代码；`profiling.py` 和 `sample_index.py` 分别保存训练统计和样本来源。默认规则入口、C/D 清单与 test 冻结边界保持；当前能力/限制见 `docs/b-llm-upgrades.md`。
+- B 的显式 `--b-analysis llm` 复用 D 网关和持久任务预算，先选说明，再解析文件用途与类型，程序据此选择读取器；缺失值建议仅限数值填补。`data_b/input_readers.py` 提供 TSV、逐行文本、分类目录、图片索引和有界平面 JSON/分隔记录转换，不支持嵌套或外部 JSONL，不执行生成代码。图片保留原尺寸，混合输入保留全部 RGB 像素并与文本/表格特征拼接，沿用 TaskSpec 1.0；纯文本/图片沿用 TaskSpec 2.0。缺失文本/图片的整行样本同步移除并记录原行号、数量和原因，数值缺失继续填补。A/C 训练接口保持。`reader_rules.json` 随模型冻结，`predict.py --raw-input --source-root` 复用规则。详细限制见 `docs/b-readers-and-conversion.md`。
 - `data_b/task_directory.py` 自动解析 `--task` 指定目录的说明和开发分区；`sessions/<session>/task_input/` 保存自动生成的内部任务契约、开发数据规范化结果及惰性 test 描述，`test_input/` 只在冻结后创建。任务源目录只读；不按任务名选择模型或规则分支。
 - `agent_a/` 放决策模块；`data_b/` 放任务读取、预处理和清单导出；`executor_c/` 放训练和进程管理；`evaluation_d/` 放评分及预留调用接口。各目录使用英文小写和下划线。
 - `configs/` 是不含密钥的任务配置；`docs/` 是流程、接口、来源和阅读说明；`scripts/` 是合成数据工具；`tests/` 是项目测试；`.vscode/` 放项目调试入口与缓存显示规则，不修改全局设置。

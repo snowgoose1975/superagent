@@ -12,12 +12,13 @@ from typing import Any
 import joblib
 import numpy as np
 
+from evaluation_d.metric_contracts import validate_metric_spec
+
 from .npy_reader import read_npy_array
 from .preprocessing import TablePreprocessor, validate_preprocessing
 from .profiling import table_profile
 from .raw_reader import load_feature_frame, typed_category_token
 from .sample_index import load_sample_index, save_combined_index
-from evaluation_d.metric_contracts import validate_metric_spec
 
 _TASK_FIELDS = {
     "schema_version",
@@ -326,6 +327,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
         try:
             preprocessor = TablePreprocessor(
                 kinds, options=task_spec.get("preprocessing"), allow_frequency_fallback=True,
+                max_features=4096 + sum(bool(re.fullmatch(r"__image_pixel_\d+", name)) for name in columns),
             )
             X_train = preprocessor.fit_transform(train_frame)
             X_valid = preprocessor.transform(valid_frame)

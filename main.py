@@ -226,6 +226,9 @@ def freeze_best(
         "plan.json": run_dir / "plan.json",
         "environment.json": run_dir / "environment.json",
     }
+    input_rules = Path(spec["source_root"]) / "reader_rules.json"
+    if input_rules.is_file():
+        sources["reader_rules.json"] = input_rules
     if preprocessor is not None:
         sources["preprocessor.joblib"] = preprocessor
     if "text_encoder" in best["plan"].get("pipeline", {}):

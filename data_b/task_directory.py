@@ -36,6 +36,58 @@ class TaskDirectoryError(ValueError):
     code = "TASK_DIRECTORY_INVALID"
 
 
+def _missing_content(value: Any) -> bool:
+    if value is None or isinstance(value, (float, np.floating)) and math.isnan(float(value)):
+        return True
+    return isinstance(value, (str, bytes, np.str_, np.bytes_)) and not value.strip()
+
+
+def _keep_present_samples(reader: dict, split: str, sample_rows: list[dict], reasons: list[list[str]]) -> list[int]:
+    """Record the user-selected missing-content policy without renumbering rows."""
+    kept = [index for index, items in enumerate(reasons) if not items]
+    dropped = []
+    n_dropped = 0
+    counts: dict[str, int] = {}
+    for row, items in zip(sample_rows, reasons, strict=True):
+        if items:
+            n_dropped += 1
+            if len(dropped) < 1000:
+                dropped.append({**row, "reasons": items})
+        for reason in items:
+            counts[reason] = counts.get(reason, 0) + 1
+    reader.setdefault("sample_filtering", {})[split] = {
+        "input_count": len(sample_rows), "kept_count": len(kept), "dropped_count": n_dropped,
+        "reason_counts": counts, "dropped_samples": dropped,
+        "details_truncated": n_dropped > 1000,
+    }
+    if not kept:
+        raise TaskDirectoryError(f"No usable {split} samples remain after removing missing text/images")
+    return kept
+
+
+def _filter_array_samples(values, labels, sample_rows, reader, split):
+    if len(values) != len(labels) or len(values) != len(sample_rows):
+        raise TaskDirectoryError("Features, labels and sample IDs have different row counts")
+    if reader["output_kind"] == "image":
+        reasons = [["missing_image"] if all(_missing_content(value) for value in image.flat) else [] for image in values]
+    else:
+        columns = reader["feature_columns"]
+        kinds = reader["feature_types"]
+        text_indices = [(index, name) for index, name in enumerate(columns) if kinds[name] == "text"]
+        reasons = [[f"missing_text:{name}" for index, name in text_indices if _missing_content(row[index])]
+                   for row in values]
+    kept = _keep_present_samples(reader, split, sample_rows, reasons)
+    return values[kept], labels[kept], [sample_rows[index] for index in kept]
+
+
+def _filter_csv_samples(root, header, rows, reader, source, split):
+    from .input_readers import filter_record_samples
+
+    records = [dict(zip(header, row, strict=True)) for row in rows]
+    _, positions = filter_record_samples(root, records, reader, source, split, reader["feature_types"])
+    return [rows[index] for index in positions], positions
+
+
 def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True,
                        allow_nan=False, indent=2) + "\n").encode("utf-8")
@@ -378,10 +430,12 @@ def _column_kinds(columns: list[str], values: dict[str, list], info: dict) -> di
                    "text" if _is_text_column(name, values[name]) else "categorical") for name in columns}
 
 
-def _csv_sample_rows(header: list[str], rows: list[list[str]], reader: dict, source: str, split: str) -> list[dict]:
+def _csv_sample_rows(header: list[str], rows: list[list[str]], reader: dict, source: str, split: str,
+                     source_rows: list[int] | None = None) -> list[dict]:
     indices = [header.index(name) for name in reader["id_columns"]]
     output = []
-    for i, row in enumerate(rows):
+    for position, row in enumerate(rows):
+        i = source_rows[position] if source_rows is not None else position
         parts = [row[index] for index in indices]
         if any(not value.strip() or any(c in value for c in "\r\n\0") for value in parts):
             raise TaskDirectoryError("Source sample IDs must be non-empty and contain no newline or NUL")
@@ -591,6 +645,7 @@ def discover_task_directory(
         raise TaskDirectoryError("Trial count, seed, or timeout is outside the supported range")
     inventory = _inventory(root) if resolution is None else resolution["inventory"]
     hashes: dict[str, str] = {}
+    train_image_sources: set[str] = set()
     readme = ""
     info: dict[str, Any] = {}
     readmes = [value for key, value in inventory.items()
@@ -622,7 +677,18 @@ def discover_task_directory(
     feature_families = {prefix: files for prefix, files in feature_families.items() if files}
     reader: dict[str, Any]
     split_files: dict[str, dict[str, Any]] = {}
-    if csv_files:
+    from .input_readers import (
+        IMAGE_EXTENSIONS,
+        additional_contract,
+        read_split,
+        reader_hash,
+    )
+
+    external = additional_contract(root, inventory, info, resolution,
+                                   allow_auto=not csv_files and not feature_families)
+    if external is not None:
+        reader, split_files = external
+    elif csv_files:
         if feature_families or "train" not in csv_files:
             raise TaskDirectoryError("CSV tasks require a unique train.csv and cannot include NPY feature splits")
         reader = {"format": "csv", "output_kind": "table"}
@@ -649,39 +715,82 @@ def discover_task_directory(
                                "labels_path": label_families[0][split]}
                        for split in ("train", "validation", "test") if split in split_names}
     # Hash/read train and validation only. No test file stat, header, hash, or values.
-    for split in ("train", "validation"):
+    for split in (() if external is not None else ("train", "validation")):
         if split not in split_files:
             continue
         files = split_files[split]
         relatives = [files["csv_path"]] if reader["format"] == "csv" else [*files["feature_paths"], files["labels_path"]]
         for relative in relatives:
             hashes[relative] = _sha256(_source_file(root, relative))
-    if reader["format"] == "csv":
+    if external is not None:
+        active_reads = set()
+
+        def touch(relative):
+            active_reads.add(relative)
+            digest = _sha256(_source_file(root, relative))
+            if relative in hashes and hashes[relative] != digest:
+                raise TaskDirectoryError("Source changed during reading")
+            hashes[relative] = digest
+
+        before_train = set(hashes)
+        train_X, train_y, train_index = read_split(root, split_files["train"], reader, "train", touch, fit=True)
+        train_relatives = sorted(set(hashes) - before_train)
+        if "validation" in split_files:
+            active_reads.clear()
+            valid_X, valid_y, valid_index = read_split(root, split_files["validation"], reader, "validation", touch)
+            if active_reads & set(train_relatives):
+                raise TaskDirectoryError("Training and validation reuse the same source samples")
+        if reader["output_kind"] == "table" and reader.get("mixed_inputs"):
+            info["feature_types"] = reader["feature_types"]
+    elif reader["format"] == "csv":
         train_header, train_rows = _read_csv(_source_file(root, split_files["train"]["csv_path"]))
         target = _target_column(info, readme, train_header)
         ids = _id_columns(info, readme, train_header, target)
         columns, ignored = _csv_input_columns(info, readme, train_header, target, ids)
         reader.update(target_column=target, id_columns=ids, feature_columns=columns, ignored_columns=ignored)
         train_columns = {name: [row[train_header.index(name)] for row in train_rows] for name in columns}
+        # Budget preflight and a semantic image-index reader must identify the
+        # same training resources, even before LLM types are available. Only
+        # columns whose values all resolve to existing image files qualify.
+        for values in train_columns.values():
+            present = [value for value in values if not _missing_content(value)]
+            if not present or not all(isinstance(value, str) and Path(value).suffix.lower() in IMAGE_EXTENSIONS for value in present):
+                continue
+            resources = {}
+            for relative in set(present):
+                try:
+                    resources[relative] = _source_file(root, relative)
+                except (TaskDirectoryError, OSError):
+                    continue  # Missing references are removed by the selected image reader.
+            for relative, image_path in resources.items():
+                hashes[relative] = _sha256(image_path)
+                train_image_sources.add(relative)
         kinds = _column_kinds(columns, train_columns, info)
         if all(kind == "text" for kind in kinds.values()):
             reader["output_kind"] = "text"
             reader["modality"] = {"kind": "text", "text_columns": columns, "max_characters": _MAX_FIELD_CHARACTERS}
         reader["feature_types"] = kinds
+        train_rows, train_positions = _filter_csv_samples(root, train_header, train_rows, reader, split_files["train"]["csv_path"], "train")
         train_X, train_y = _csv_arrays(train_header, train_rows, reader)
-        train_index = _csv_sample_rows(train_header, train_rows, reader, split_files["train"]["csv_path"], "train")
+        train_index = _csv_sample_rows(train_header, train_rows, reader, split_files["train"]["csv_path"], "train", train_positions)
         if "validation" in split_files:
             valid_header, valid_rows = _read_csv(_source_file(root, split_files["validation"]["csv_path"]))
+            valid_rows, valid_positions = _filter_csv_samples(root, valid_header, valid_rows, reader,
+                                                              split_files["validation"]["csv_path"], "validation")
             valid_X, valid_y = _csv_arrays(valid_header, valid_rows, reader)
-            valid_index = _csv_sample_rows(valid_header, valid_rows, reader, split_files["validation"]["csv_path"], "validation")
+            valid_index = _csv_sample_rows(valid_header, valid_rows, reader, split_files["validation"]["csv_path"], "validation", valid_positions)
     else:
         train_X, widths = _read_npy_matrix(root, split_files["train"]["feature_paths"])
+        train_y = read_npy_array(_source_file(root, split_files["train"]["labels_path"]))
+        train_index = _array_sample_rows(len(train_y), split_files["train"], "train")
         if not 1 <= len(train_X) <= _MAX_ROWS:
             raise TaskDirectoryError("Training features are empty or exceed the row limit")
         if train_X.ndim in (3, 4):
             if len(reader["feature_prefixes"]) != 1:
                 raise TaskDirectoryError("Image tasks cannot combine feature sources")
-            reader.update(output_kind="image", modality=_image_modality(train_X), feature_columns=[])
+            reader.update(output_kind="image", feature_columns=[])
+            train_X, train_y, train_index = _filter_array_samples(train_X, train_y, train_index, reader, "train")
+            reader["modality"] = _image_modality(train_X)
         else:
             if train_X.ndim == 1:
                 train_X = train_X.reshape(-1, 1)
@@ -698,22 +807,27 @@ def discover_task_directory(
                 kinds.update({name: forced for name, forced in zip(columns, forced_kinds, strict=True) if forced})
             reader.update(feature_columns=columns, feature_types=kinds)
             implicit_text = (len(columns) == 1 and reader["feature_prefixes"][0] not in {"n", "c"}
-                             and all(isinstance(value, (str, bytes, np.str_, np.bytes_)) for value in train_X[:, 0]))
+                             and any(isinstance(value, (str, bytes, np.str_, np.bytes_)) for value in train_X[:, 0])
+                             and all(isinstance(value, (str, bytes, np.str_, np.bytes_)) or _missing_content(value)
+                                     for value in train_X[:, 0]))
             if (reader["feature_prefixes"] == ["text"] or implicit_text
                     or all(kind == "text" for kind in kinds.values())):
-                reader.update(output_kind="text", modality={"kind": "text", "text_columns": columns,
+                reader.update(output_kind="text", feature_types=dict.fromkeys(columns, "text"),
+                              modality={"kind": "text", "text_columns": columns,
                                                             "max_characters": _MAX_FIELD_CHARACTERS})
+            train_X, train_y, train_index = _filter_array_samples(train_X, train_y, train_index, reader, "train")
         train_X = _npy_features(train_X, reader)
-        train_y = _labels(read_npy_array(_source_file(root, split_files["train"]["labels_path"])))
-        train_index = _array_sample_rows(len(train_y), split_files["train"], "train")
+        train_y = _labels(train_y)
         if "validation" in split_files:
             valid_X, _ = _read_npy_matrix(root, split_files["validation"]["feature_paths"])
-            valid_X = _npy_features(valid_X, reader)
-            valid_y = _labels(read_npy_array(_source_file(root, split_files["validation"]["labels_path"])))
+            valid_y = read_npy_array(_source_file(root, split_files["validation"]["labels_path"]))
             valid_index = _array_sample_rows(len(valid_y), split_files["validation"], "validation")
+            valid_X, valid_y, valid_index = _filter_array_samples(valid_X, valid_y, valid_index, reader, "validation")
+            valid_X = _npy_features(valid_X, reader)
+            valid_y = _labels(valid_y)
     if len(train_X) != len(train_y):
         raise TaskDirectoryError("Training features and labels have different row counts")
-    n_source_train = len(train_y)
+    n_source_train = reader.get("sample_filtering", {}).get("train", {}).get("input_count", len(train_y))
     split_strategy: dict[str, Any] = {"kind": "provided_validation"}
     if "validation" not in split_files:
         train_X, train_y, valid_X, valid_y, train_rows, valid_rows = _holdout_train(
@@ -724,13 +838,16 @@ def discover_task_directory(
         split_strategy = {"kind": "stratified_train_holdout", "fraction": 0.2, "random_seed": random_seed}
     if len(valid_X) != len(valid_y):
         raise TaskDirectoryError("Training or validation features and labels have different row counts")
+    if external is not None and ({row["sample_id"] for row in train_index} & {row["sample_id"] for row in valid_index}):
+        raise TaskDirectoryError("Training and validation sample IDs overlap")
     label_values, label_names = _label_schema(train_y)
     _check_declared_metadata(info, reader, n_source_train=n_source_train,
-                             n_validation=len(valid_y), n_classes=len(label_values))
+                             n_validation=reader.get("sample_filtering", {}).get("validation", {}).get("input_count", len(valid_y)),
+                             n_classes=len(label_values))
     for relative, digest in hashes.items():
         if _sha256(_source_file(root, relative)) != digest:
             raise TaskDirectoryError("Development data or instructions changed during discovery")
-    code_hash = _sha256(Path(__file__))
+    code_hash = hashlib.sha256((_sha256(Path(__file__)) + reader_hash()).encode()).hexdigest()
     train_policy = {"max_trials": max_trials, "random_seed": random_seed,
                     "timeout_seconds": timeout_seconds}
     identity = {"sources": hashes, "reader": reader, "metric": metric, "split_strategy": split_strategy,
@@ -805,18 +922,25 @@ def discover_task_directory(
             or _describes_pairwise_preference(task_description)
         )
     train_files = split_files["train"]
-    train_relatives = [train_files["csv_path"]] if reader["format"] == "csv" else [*train_files["feature_paths"], train_files["labels_path"]]
+    if external is None:
+        train_relatives = [train_files["csv_path"]] if reader["format"] == "csv" else [*train_files["feature_paths"], train_files["labels_path"]]
+        train_relatives = [*train_relatives, *sorted(train_image_sources)]
     report = {"schema_version": "1.0", "task_id": task_id, "data_version": version,
               "source_root": str(root), "source_files_sha256": hashes,
               "reader_code_sha256": code_hash, "reader": reader, "metric_source": metric_source,
               "n_train": len(train_y), "n_validation": len(valid_y),
               "n_source_train": n_source_train, "validation_split": split_strategy,
+              "sample_filtering": reader.get("sample_filtering", {}),
               "test_read_during_discovery": False, "test_files": split_files.get("test"),
               "overlapping_partition_ids": len({r["sample_id"] for r in train_index}
                                                & {r["sample_id"] for r in valid_index}),
               "dropped_id_columns": reader.get("id_columns", []),
               "budget_fingerprint": hashlib.sha256(_json_bytes(sorted(hashes[name] for name in train_relatives))).hexdigest()}
     _write_json(destination / "task.auto.json", spec)
+    if external is not None:
+        _write_json(destination / "reader_rules.json", {
+            "schema_version": "1.0", "reader_sha256": reader_hash(), "reader": reader,
+        })
     _write_json(destination / "discovery_report.json", report)
     _write_json(destination / "task_context.json", context)
     return {"task_spec": spec, "test_descriptor_path": descriptor_path,
@@ -831,7 +955,10 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
     if (not isinstance(descriptor, dict) or descriptor.get("schema_version") != "2.0"
             or descriptor.get("kind") != "task_directory"):
         raise TaskDirectoryError("Unsupported automatic test descriptor")
-    if descriptor.get("reader_code_sha256") != _sha256(Path(__file__)):
+    from .input_readers import FORMATS, read_split, reader_hash
+
+    code_hash = hashlib.sha256((_sha256(Path(__file__)) + reader_hash()).encode()).hexdigest()
+    if descriptor.get("reader_code_sha256") != code_hash:
         raise TaskDirectoryError("Task reader changed. Preserve the old descriptor and rediscover the task")
     root = Path(descriptor["source_root"]).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -840,26 +967,41 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
     if destination.is_relative_to(root):
         raise TaskDirectoryError("Final test staging must be outside the task directory")
     reader, files = descriptor["reader"], descriptor["test_files"]
-    if reader.get("format") == "csv":
+    before = {}
+    if reader.get("format") in FORMATS:
+        def touch(relative):
+            digest = _sha256(_source_file(root, relative))
+            if relative in before and before[relative] != digest:
+                raise TaskDirectoryError("Test input changed during reading")
+            before[relative] = digest
+
+        X, y, sample_rows = read_split(root, files, reader, "test", touch)
+        relatives = list(before)
+    elif reader.get("format") == "csv":
         relatives = [files["csv_path"]]
     elif reader.get("format") == "npy":
         relatives = [*files["feature_paths"], files["labels_path"]]
     else:
         raise TaskDirectoryError("Unsupported test descriptor reader")
-    before = {name: _sha256(_source_file(root, name)) for name in relatives}
+    if reader.get("format") not in FORMATS:
+        before = {name: _sha256(_source_file(root, name)) for name in relatives}
     if reader["format"] == "csv":
         header, rows = _read_csv(_source_file(root, files["csv_path"]))
+        rows, source_rows = _filter_csv_samples(root, header, rows, reader, files["csv_path"], "test")
         X, y = _csv_arrays(header, rows, reader)
-        sample_rows = _csv_sample_rows(header, rows, reader, files["csv_path"], "test")
-    else:
+        sample_rows = _csv_sample_rows(header, rows, reader, files["csv_path"], "test", source_rows)
+    elif reader["format"] == "npy":
         X, _ = _read_npy_matrix(root, files["feature_paths"])
-        X = _npy_features(X, reader)
-        y = _labels(read_npy_array(_source_file(root, files["labels_path"])))
+        y = read_npy_array(_source_file(root, files["labels_path"]))
         sample_rows = _array_sample_rows(len(y), files, "test")
+        X, y, sample_rows = _filter_array_samples(X, y, sample_rows, reader, "test")
+        X = _npy_features(X, reader)
+        y = _labels(y)
     if len(X) != len(y):
         raise TaskDirectoryError("Test features and labels have different row counts")
     declared = descriptor.get("n_samples")
-    if declared is not None and declared != len(y):
+    original_count = reader.get("sample_filtering", {}).get("test", {}).get("input_count", len(y))
+    if declared is not None and declared != original_count:
         raise TaskDirectoryError("Test row count differs from the declared test_size")
     after = {name: _sha256(_source_file(root, name)) for name in relatives}
     if before != after or _sha256(descriptor_file) != descriptor_hash:
@@ -877,6 +1019,8 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
         "source_root": str(root), "source_files_sha256": after,
         "descriptor_sha256": descriptor_hash, "reader_code_sha256": descriptor["reader_code_sha256"],
         "reader": reader, "n_samples": len(y),
+        "original_n_samples": original_count,
+        "sample_filtering": reader.get("sample_filtering", {}).get("test", {}),
         "sample_index_path": "sample_index_test.csv",
         "sample_index_sha256": _sha256(destination / "sample_index_test.csv"),
     })
