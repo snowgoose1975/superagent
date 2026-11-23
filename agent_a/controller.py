@@ -6,9 +6,11 @@ import copy
 import math
 from typing import Any
 
+from evaluation_d.school_gateway import GatewayError
 from executor_c.contracts import validate_plan
 from executor_c.diagnostics import safe_history_view
 from executor_c.model_registry import (
+    PAIRWISE_MODEL_ID,
     models_for_profile,
     normalize_pipeline,
     text_pipeline_candidates,
@@ -34,7 +36,7 @@ class PackageAController:
     """Adapt the classmate's deterministic planner to the v2 A interface."""
 
     mode = "offline_rules"
-    strategy_source = "同学A：a-agent-v1/rule_based_hill_climb_v1"
+    strategy_source = "Classmate A: a-agent-v1/rule_based_hill_climb_v1"
 
     def __init__(
         self,
@@ -147,8 +149,12 @@ class PackageAController:
         search["phase"] = "legacy"
         search["pending_model_ids"] = []
         if self.search_profile == "expanded":
-            available = models_for_profile(
-                "expanded", data_overview["representations"]
+            models = context.get("capabilities", {}).get("models")
+            available = (
+                models_for_profile("expanded", data_overview["representations"])
+                if models is None else [
+                    name for name, spec in models.items() if "expanded" in spec.get("profiles", [])
+                ]
             )
             tried_models = {
                 item["model"] for item in self._map_history(context.get("history", []))
@@ -160,6 +166,8 @@ class PackageAController:
                 tried_recipes = set()
                 for item in self._map_history(context.get("history", [])):
                     pipeline = normalize_pipeline("raw_text", item.get("pipeline", {}))
+                    if pipeline.get("text_vectorizer", {}).get("name") != "tfidf":
+                        continue
                     params = pipeline["text_vectorizer"]["params"]
                     strategy = tuple(
                         params[key]
@@ -177,6 +185,10 @@ class PackageAController:
                     for model in available
                     for pipeline in text_pipeline_candidates(self.n_features)
                     if (
+                        model != PAIRWISE_MODEL_ID
+                        or pipeline["text_vectorizer"]["params"]["field_mode"] == "separate"
+                    )
+                    and (
                         model,
                         *(
                             pipeline["text_vectorizer"]["params"][key]
@@ -271,14 +283,20 @@ class SchoolAController(PackageAController):
     """Use the school gateway for one LLM proposal, with safe rule fallback."""
 
     mode = "school_llm"
-    strategy_source = "同学A：a-agent-v1/LLMPlanner + rule_based_hill_climb_v1 fallback"
+    strategy_source = "Classmate A: a-agent-v1/LLMPlanner + rule_based_hill_climb_v1 fallback"
 
     def __init__(
-        self, task_id: str, data_version: str, n_features: int, *, gateway: Any, **kwargs: Any
+        self, task_id: str, data_version: str, n_features: int, *, gateway: Any,
+        local_after_paid_limit: bool = False, **kwargs: Any
     ):
         super().__init__(task_id, data_version, n_features, **kwargs)
         self.gateway = gateway
+        self.local_after_paid_limit = local_after_paid_limit
         self.gateway_metadata = gateway.metadata()
+        self.local_only_reason: str | None = None
+        self.consecutive_empty_replies = 0
+        self.consecutive_early_stops = 0
+        self.round_fallback_reason: str | None = None
         self._events = _DecisionEvents()
         self.llm_planner = LLMPlanner(
             self._call_gateway,
@@ -310,12 +328,20 @@ class SchoolAController(PackageAController):
     def decide(self, context: dict[str, Any]) -> dict[str, Any]:
         self.last_decision_source = "none"
         self._events.names.clear()
+        self.round_fallback_reason = None
         remaining_trials = context.get("remaining_trials")
         if type(remaining_trials) is not int or remaining_trials <= 0:
             return self._finish(
                 {"action": "stop", "reason": "main_trial_limit_reached"}, "trial_limit"
             )
+        if self.local_only_reason is not None:
+            return self._decide_locally(context)
         if not self.gateway.can_call:
+            if self.local_after_paid_limit:
+                reason = getattr(self.gateway, "paid_limit_reason", None)
+                if reason is not None:
+                    self.local_only_reason = reason
+                    return self._decide_locally(context)
             return self._finish(
                 {"action": "stop", "reason": "school_gateway_call_unavailable"}, "gateway_stop"
             )
@@ -333,10 +359,50 @@ class SchoolAController(PackageAController):
                 )
         else:
             self.gateway.set_request_timeout_cap(None)
-        upstream_context = self._upstream_context(
-            context, remaining_budget=float(self.gateway.remaining_budget_rmb)
-        )
-        decision = upstream_decide({**upstream_context, "planner": self.llm_planner})
+        remaining_budget = float(self.gateway.remaining_budget_rmb)
+        if self.local_after_paid_limit and remaining_budget <= 0:
+            self.local_only_reason = "BUDGET_EXCEEDED"
+            return self._decide_locally(context)
+        upstream_context = self._upstream_context(context, remaining_budget=remaining_budget)
+        try:
+            decision = upstream_decide({**upstream_context, "planner": self.llm_planner})
+        except GatewayError as exc:
+            if self.local_after_paid_limit and exc.code in {"TASK_BALANCE_EXHAUSTED", "BUDGET_EXCEEDED", "CALL_LIMIT"}:
+                self.local_only_reason = exc.code
+                return self._decide_locally(context)
+            if exc.code != "INVALID_RESPONSE":
+                raise
+            metadata = self.gateway.metadata()
+            if metadata.get("usage_status") != "known" or metadata.get("blocked_reason") != exc.code:
+                raise
+            self.consecutive_empty_replies += 1
+            self.consecutive_early_stops = 0
+            self.llm_planner.note_empty_reply()
+            if (
+                self.local_after_paid_limit and self.consecutive_empty_replies == 1
+                and self.gateway.recover_empty_reply()
+            ):
+                self.round_fallback_reason = exc.code
+                return self._decide_locally(context)
+            self.local_only_reason = exc.code
+            return self._decide_locally(context)
+        self.consecutive_empty_replies = 0
+        school_stop = "llm_planner_stop" in self._events.names
+        upstream_search = upstream_context["search"]
+        minimum = upstream_search.get("min_exploration_trials", 8)
+        if (
+            self.local_after_paid_limit and school_stop and (
+                upstream_search["phase"] == "coverage" or len(context.get("history", [])) < minimum
+            )
+        ):
+            self.consecutive_early_stops += 1
+            if self.consecutive_early_stops == 1:
+                self.round_fallback_reason = "SCHOOL_PLANNER_STOP"
+                self.llm_planner.note_early_stop()
+            else:
+                self.local_only_reason = "SCHOOL_PLANNER_STOP"
+            return self._decide_locally(context)
+        self.consecutive_early_stops = 0
         if "llm_planner_decision" in self._events.names:
             source = "llm"
         elif "llm_planner_fallback" in self._events.names:
@@ -346,3 +412,8 @@ class SchoolAController(PackageAController):
         else:
             source = "rules"
         return self._finish(decision, source)
+
+    def _decide_locally(self, context: dict[str, Any]) -> dict[str, Any]:
+        rule_context = self._upstream_context(context, remaining_budget=None)
+        rule_context["planning_mode"] = "offline_rules"
+        return self._finish(upstream_decide(rule_context), "rules_after_school_response")

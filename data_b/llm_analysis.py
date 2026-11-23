@@ -11,11 +11,17 @@ import os
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from evaluation_d.school_gateway import GatewayError
+
 from .preprocessing import validate_preprocessing
 
 
 class AnalysisError(ValueError):
     code = "B_ANALYSIS_INVALID"
+
+
+class EmptyAnalysisReply(AnalysisError):
+    """A B-stage reply had no usable text after its correction allowance."""
 
 
 def _write(path, value):
@@ -27,22 +33,22 @@ def _unique(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise AnalysisError("LLM JSON 含重复字段")
+            raise AnalysisError("The LLM JSON contains duplicate fields")
         result[key] = value
     return result
 
 
 def _json(text):
     if not isinstance(text, str) or len(text.encode("utf-8")) > 32000:
-        raise AnalysisError("LLM 输出必须是有界 JSON 文本")
+        raise AnalysisError("The LLM output must be JSON text within the configured size limit")
     text = text.strip()
     if text.startswith("```json\n") and text.endswith("```"):
         text = text[8:-3]
     def invalid(_):
-        raise AnalysisError("JSON 不允许非有限数字")
+        raise AnalysisError("JSON cannot contain nonfinite numbers")
     value = json.loads(text, object_pairs_hook=_unique, parse_constant=invalid)
     if not isinstance(value, dict):
-        raise AnalysisError("LLM 必须返回 JSON 对象")
+        raise AnalysisError("The LLM must return a JSON object")
     return value
 
 
@@ -56,24 +62,41 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
         )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
-    if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > 15000:
-        raise AnalysisError("B 分析上下文超过 15000 字节；请缩小说明或文件清单")
     for attempt in range(2):
-        # Exceptions from D (including unknown usage) propagate; never retry them.
-        reply = gateway.call_llm(messages)
+        if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > 15000:
+            raise AnalysisError(
+                "Data preparation context exceeds 15,000 bytes. Shorten the documents or file inventory."
+            )
         try:
-            value = _json(reply["text"])
-            result = validate(value)
-        except (ValueError, TypeError, KeyError) as exc:
-            _write(audit_dir / f"{stage}_invalid_{attempt}.json",
-                   {"stage": stage, "error": str(exc)[:500]})
-            if attempt:
-                raise AnalysisError(f"{stage} 输出两次未通过校验") from exc
-            messages = [*messages[:2], {"role": "user", "content":
-                        "Return a corrected complete JSON object. Validation error: " + str(exc)[:500]}]
-            continue
-        _write(audit_dir / f"{stage}.json", result)
-        return result
+            reply = gateway.call_llm(messages)
+        except GatewayError as exc:
+            if exc.code != "INVALID_RESPONSE":
+                # A failed transport can carry unknown usage. Let the gateway stop the run.
+                raise
+            _write(
+                audit_dir / f"{stage}_invalid_{attempt}.json",
+                {"stage": stage, "error_code": exc.code},
+            )
+            if attempt or not gateway.recover_empty_reply():
+                raise EmptyAnalysisReply(f"{stage} returned no usable JSON text") from exc
+            correction = "The previous reply contained no usable text. Return only the complete JSON object."
+        else:
+            try:
+                value = _json(reply["text"])
+                result = validate(value)
+            except (ValueError, TypeError, KeyError) as exc:
+                detail = str(exc)[:500]
+                _write(
+                    audit_dir / f"{stage}_invalid_{attempt}.json",
+                    {"stage": stage, "error": detail},
+                )
+                if attempt:
+                    raise AnalysisError(f"{stage} output failed validation twice") from exc
+                correction = "Return a corrected complete JSON object. Validation error: " + detail
+            else:
+                _write(audit_dir / f"{stage}.json", result)
+                return result
+        messages.append({"role": "user", "content": correction})
 
 
 def _inventory(root):
@@ -86,10 +109,10 @@ def _inventory(root):
                 continue
             relative = (Path(directory) / name).relative_to(root).as_posix()
             if len(relative.encode("utf-8")) > 240:
-                raise AnalysisError("文件相对路径过长")
+                raise AnalysisError("The relative file path is too long")
             files.append(relative)
             if len(files) > 256:
-                raise AnalysisError("任务目录超过 256 个文件；需要有界清单读取器")
+                raise AnalysisError("The task directory exceeds the limit of 256 files")
     return files
 
 
@@ -97,7 +120,7 @@ def _safe_relative(relative, inventory):
     if (not isinstance(relative, str) or relative not in inventory or "\\" in relative
             or PurePosixPath(relative).is_absolute() or PureWindowsPath(relative).drive
             or any(part.startswith(".") for part in PurePosixPath(relative).parts)):
-        raise AnalysisError("文件路径不在任务清单内")
+        raise AnalysisError("The file path is absent from the task inventory")
     return relative
 
 
@@ -108,40 +131,40 @@ def collect_documents(root, inventory, document_paths=None):
         document_paths = [name for name in inventory if Path(name).suffix.lower() in {".md", ".rst"}
                           and not re.search(r"(?:^|[/_.-])test(?:[/_.-]|$)", name, re.I)]
     if not document_paths or len(document_paths) > 4:
-        raise AnalysisError("需要 1–4 份任务说明；任意命名的 TXT/JSON 请用 --task-doc 显式指定")
+        raise AnalysisError("Supply 1 to 4 task documents. Specify TXT or JSON with --task-doc.")
     documents = {}
     for relative in document_paths:
         _safe_relative(relative, inventory)
         if Path(relative).suffix.lower() not in {".md", ".rst", ".txt", ".json"}:
-            raise AnalysisError("不支持的任务说明格式")
+            raise AnalysisError("Unsupported task document format")
         path = (root / relative).resolve(strict=True)
         if not path.is_relative_to(root) or not path.is_file():
-            raise AnalysisError("说明文件路径越出任务目录")
+            raise AnalysisError("The task document path escapes the task directory")
         if path.stat().st_size > 8000:
-            raise AnalysisError("单份任务说明超过 8000 字节")
+            raise AnalysisError("A task document exceeds 8,000 bytes")
         documents[relative] = path.read_text(encoding="utf-8-sig")
     if sum(len(text.encode("utf-8")) for text in documents.values()) > 9000:
-        raise AnalysisError("任务说明总计超过 9000 字节")
+        raise AnalysisError("Task documents exceed 9,000 bytes in total")
     return documents
 
 
 def _evidence(value, documents):
     if not isinstance(value, list) or len(value) > 40:
-        raise AnalysisError("evidence 必须为有界证据列表")
+        raise AnalysisError("evidence must be a list within the configured bounds")
     for item in value:
         if not isinstance(item, dict) or set(item) != {"field", "document", "quote"}:
-            raise AnalysisError("证据需要 field/document/quote")
+            raise AnalysisError("Evidence requires field, document, and quote")
         if (not all(isinstance(v, str) for v in item.values()) or not item["quote"].strip()
                 or len(item["quote"]) > 1200 or item["document"] not in documents
                 or item["quote"] not in documents[item["document"]]):
-            raise AnalysisError("证据不是所提供说明中的原文")
+            raise AnalysisError("The evidence quote is absent from the supplied document")
     return value
 
 
 def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
     root = Path(task_dir).resolve(strict=True)
     if not root.is_dir():
-        raise AnalysisError("任务输入必须是目录")
+        raise AnalysisError("The task input must be a directory")
     audit = Path(audit_dir)
     audit.mkdir(parents=True, exist_ok=False)
     files = _inventory(root)
@@ -158,11 +181,11 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
     }
     def validate(value):
         if set(value) != set(schema):
-            raise AnalysisError("layout 字段不完整或包含未知字段")
+            raise AnalysisError("layout has missing or unknown fields")
         if value["unresolved_questions"] != []:
-            raise AnalysisError("任务仍有未解决项，停止而不猜测")
+            raise AnalysisError("The task has unresolved layout questions")
         if value["format"] not in {"csv", "npy"}:
-            raise AnalysisError("当前读取器支持 CSV 和 NPY，不能假装支持未知格式")
+            raise AnalysisError("The task reader supports CSV and NPY")
         from evaluation_d.metric_contracts import validate_metric_spec
         validate_metric_spec({"name": value["metric"], "greater_is_better": value["metric"] != "log_loss"})
         evidence = _evidence(value["evidence"], documents)
@@ -170,54 +193,54 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
             if field == "target_column" and value["format"] == "npy":
                 continue
             if not any(item["field"] == field for item in evidence):
-                raise AnalysisError(f"缺少 {field} 的说明依据")
+                raise AnalysisError(f"Missing document evidence for {field}")
         if value["format"] == "csv" and not any(
                 item["field"] == "target_column" and isinstance(value["target_column"], str)
                 and value["target_column"] in item["quote"] for item in evidence):
-            raise AnalysisError("标签列名不在标签证据中")
-        metric_patterns = {"accuracy": r"\baccuracy\b|准确率",
-                           "f1_macro": r"macro[ _-]*f1|f1[ _-]*macro|宏.*f1",
-                           "log_loss": r"log[ _-]*loss|cross[ _-]*entropy|对数损失|交叉熵"}
+            raise AnalysisError("The label quote does not name the target column")
+        metric_patterns = {"accuracy": r"\baccuracy\b|\u51c6\u786e\u7387",
+                           "f1_macro": r"macro[ _-]*f1|f1[ _-]*macro|\u5b8f.*f1",
+                           "log_loss": r"log[ _-]*loss|cross[ _-]*entropy|\u5bf9\u6570\u635f\u5931|\u4ea4\u53c9\u71b5"}
         if not any(item["field"] == "metric" and re.search(metric_patterns[value["metric"]], item["quote"], re.I)
                    for item in evidence):
-            raise AnalysisError("评价指标与引用证据不匹配")
+            raise AnalysisError("The metric does not match the cited evidence")
         prefixes = value["feature_prefixes"]
         if value["format"] == "npy" and prefixes not in (["x"], ["n"], ["c"], ["text"], ["images"], ["n", "c"]):
-            raise AnalysisError("不支持该 NPY 特征组织方式")
+            raise AnalysisError("Unsupported NPY feature organization")
         parts = value["partitions"]
         if not isinstance(parts, dict) or set(parts) != {"train", "validation", "test"} or parts["train"] is None:
-            raise AnalysisError("partitions 需要 train，可选 validation/test")
+            raise AnalysisError("partitions requires train and allows validation and test")
         used = set()
         for role, part in parts.items():
             if part is None:
                 continue
             if not isinstance(part, dict) or set(part) != {"features", "labels"}:
-                raise AnalysisError("分区必须含 features/labels")
+                raise AnalysisError("A partition must contain features and labels")
             paths = part["features"]
             width = 1 if value["format"] == "csv" else len(prefixes)
             if not isinstance(paths, list) or len(paths) != width:
-                raise AnalysisError("分区特征文件数量不匹配")
+                raise AnalysisError("The partition feature file count is incorrect")
             if value["format"] == "csv" and (part["labels"] is not None or not isinstance(value["target_column"], str) or not value["target_column"].strip()):
-                raise AnalysisError("CSV 需要嵌入式标签列，labels 必须为 null")
+                raise AnalysisError("CSV labels must be embedded in a column, with the labels path set to null")
             if value["format"] == "npy":
                 paths = [*paths, part["labels"]]
             for path in paths:
                 _safe_relative(path, files)
                 if Path(path).suffix.lower() != "." + value["format"] or path in used:
-                    raise AnalysisError("分区文件格式错误、重复或跨分区复用")
+                    raise AnalysisError("Partition files have an invalid format, duplicate paths, or overlapping roles")
                 used.add(path)
                 quotes = [item["quote"] for item in evidence if item["field"] == role]
                 if not any(path in quote for quote in quotes):
-                    raise AnalysisError(f"{role} 的文件用途缺少包含相对路径的原文依据")
+                    raise AnalysisError(f"{role} requires a document quote with the relative path")
         for key in ("feature_columns", "id_columns"):
             if not isinstance(value[key], list) or len(value[key]) > 4096 or any(not isinstance(n, str) or not n.strip() for n in value[key]) or len(set(value[key])) != len(value[key]):
-                raise AnalysisError("字段名列表无效")
+                raise AnalysisError("The column name list is invalid")
         if not isinstance(value["feature_types"], dict) or any(kind not in {"numeric", "categorical", "text"} for kind in value["feature_types"].values()):
-            raise AnalysisError("feature_types 无效")
+            raise AnalysisError("feature_types is invalid")
         if value["feature_types"] and set(value["feature_types"]) != set(value["feature_columns"]):
-            raise AnalysisError("声明类型时必须同时列出全部 feature_columns")
+            raise AnalysisError("A declared feature type map requires the complete feature_columns list")
         if value["target_column"] in value["feature_columns"] or set(value["id_columns"]) & set(value["feature_columns"]):
-            raise AnalysisError("标签或 ID 不得声明为特征")
+            raise AnalysisError("Target and ID columns are reserved and cannot be features")
         return value
     value = _request(gateway, "layout", {"files": files, "documents": documents, "output_schema": schema},
                      "Identify the roles of files from documentation, not fixed names. "
@@ -248,7 +271,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
 
 def review_quality(task_spec, gateway, audit_dir, documents):
     from .prepare import _load_partition
-    from .profiling import table_profile, modality_profile
+    from .profiling import modality_profile, table_profile
     spec = copy.deepcopy(task_spec)
     root = Path(spec["source_root"])
     if spec["schema_version"] == "1.0":
@@ -263,25 +286,25 @@ def review_quality(task_spec, gateway, audit_dir, documents):
     bounded["column_statistics"] = bounded.get("column_statistics", [])[:32]
     def validate(value):
         if set(value) != {"findings", "type_overrides", "preprocessing", "evidence", "unresolved_questions"}:
-            raise AnalysisError("quality 字段不符合约定")
+            raise AnalysisError("The quality review fields are invalid")
         if value["unresolved_questions"] != []:
-            raise AnalysisError("数据质量存在未解决项")
+            raise AnalysisError("The quality review has unresolved issues")
         if not isinstance(value["findings"], list) or len(value["findings"]) > 32 or any(not isinstance(item, str) or len(item) > 400 for item in value["findings"]):
-            raise AnalysisError("findings 必须为有界文字列表")
+            raise AnalysisError("findings must be a bounded list of strings")
         evidence = _evidence(value["evidence"], documents)
         overrides = value["type_overrides"]
         if not isinstance(overrides, dict):
-            raise AnalysisError("type_overrides 必须为对象")
+            raise AnalysisError("type_overrides must be an object")
         if spec["schema_version"] != "1.0":
             if overrides or value["preprocessing"]:
-                raise AnalysisError("文本/图像流水线由 C 管理，B 本次只能报告诊断")
+                raise AnalysisError("The executor controls text and image pipelines. B can report diagnostics for these modes.")
             return value
         kinds = dict(spec["feature_types"])
         for column, kind in overrides.items():
             if column not in kinds or kind not in {"numeric", "categorical", "text"}:
-                raise AnalysisError("类型覆盖含未知字段或类型")
+                raise AnalysisError("A type override contains an unknown field or type")
             if not any(item["field"] == column and column in item["quote"] for item in evidence):
-                raise AnalysisError("类型修正需要字段对应的说明原文")
+                raise AnalysisError("A type override requires an exact document quote naming the field")
             kinds[column] = kind
         options = validate_preprocessing(value["preprocessing"], kinds)
         for column, markers in options.get("missing_values", {}).items():
@@ -290,7 +313,7 @@ def review_quality(task_spec, gateway, audit_dir, documents):
                 pattern = r"(?<![\w.+-])" + number + r"(?:\.0+)?(?![\w.])"
                 if not any(item["field"] == column and column in item["quote"]
                            and re.search(pattern, item["quote"]) for item in evidence):
-                    raise AnalysisError("特殊缺失标记需要字段和值对应的说明原文")
+                    raise AnalysisError("A missing-value sentinel requires an exact document quote naming the field and value")
         return value
     result = _request(gateway, "quality", {"training_statistics": bounded, "documents": documents,
                       "feature_types": spec.get("feature_types", {}),

@@ -1,6 +1,6 @@
 {
   "schema_version": "2.0",
-  "registry_version": "1.1",
+  "registry_version": "1.4",
   "problem_type": "classification",
   "models": {
     "random_forest": {
@@ -237,6 +237,99 @@
         }
       ]
     },
+    "paired_logistic_regression": {
+      "builder_id": "paired_logistic_regression",
+      "parameters": {
+        "C": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.001,
+          "maximum": 100.0
+        },
+        "max_iter": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 2000
+        }
+      },
+      "representations": [
+        "raw_text"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": false,
+      "predict_proba": true,
+      "fixed_settings": {
+        "solver": "lbfgs",
+        "fit_intercept": false
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {},
+        {
+          "C": 0.3
+        },
+        {
+          "C": 3.0
+        }
+      ]
+    },
+    "rbf_svc": {
+      "builder_id": "rbf_svc",
+      "parameters": {
+        "C": {
+          "type": "number",
+          "default": 10.0,
+          "minimum": 0.001,
+          "maximum": 100.0
+        },
+        "gamma": {
+          "type": "number",
+          "default": 0.01,
+          "minimum": 1e-06,
+          "maximum": 10.0
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "dense_numeric",
+        "image_tensor"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "calibration": "sigmoid",
+        "cv": 3,
+        "cache_size_mb": 96
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {},
+        {
+          "C": 1.0
+        },
+        {
+          "gamma": 0.001
+        },
+        {
+          "gamma": 0.1
+        }
+      ]
+    },
     "multinomial_nb": {
       "builder_id": "multinomial_nb",
       "parameters": {
@@ -399,6 +492,226 @@
         }
       ]
     },
+    "sgd_logistic": {
+      "builder_id": "sgd_logistic",
+      "parameters": {
+        "alpha": {
+          "type": "number",
+          "default": 0.0001,
+          "minimum": 1e-06,
+          "maximum": 0.1
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "raw_text"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "loss": "log_loss",
+        "max_iter": 2000
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {},
+        {
+          "alpha": 1e-05
+        },
+        {
+          "alpha": 0.001
+        },
+        {
+          "class_weight": "balanced"
+        }
+      ]
+    },
+    "linear_svc": {
+      "builder_id": "linear_svc",
+      "parameters": {
+        "C": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.001,
+          "maximum": 100.0
+        },
+        "class_weight": {
+          "type": "optional_enum",
+          "default": null,
+          "choices": [
+            null,
+            "balanced"
+          ]
+        }
+      },
+      "representations": [
+        "raw_text",
+        "dense_numeric"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "calibration": "sigmoid",
+        "cv": 3
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {
+          "C": 1.0
+        },
+        {
+          "C": 0.1
+        },
+        {
+          "C": 5.0
+        },
+        {
+          "C": 1.0,
+          "class_weight": "balanced"
+        }
+      ]
+    },
+    "xgboost": {
+      "builder_id": "xgboost",
+      "parameters": {
+        "n_estimators": {
+          "type": "integer",
+          "default": 400,
+          "minimum": 25,
+          "maximum": 2000
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 12
+        },
+        "learning_rate": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0.01,
+          "maximum": 0.5
+        },
+        "subsample": {
+          "type": "number",
+          "default": 0.85,
+          "minimum": 0.3,
+          "maximum": 1.0
+        },
+        "colsample_bytree": {
+          "type": "number",
+          "default": 0.85,
+          "minimum": 0.3,
+          "maximum": 1.0
+        },
+        "reg_lambda": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 100.0
+        }
+      },
+      "representations": [
+        "dense_numeric"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "tree_method": "hist",
+        "device": "cpu",
+        "n_jobs": 1
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {},
+        {
+          "max_depth": 3
+        },
+        {
+          "max_depth": 7
+        },
+        {
+          "n_estimators": 800,
+          "learning_rate": 0.03
+        }
+      ]
+    },
+    "catboost": {
+      "builder_id": "catboost",
+      "parameters": {
+        "iterations": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 25,
+          "maximum": 2500
+        },
+        "depth": {
+          "type": "integer",
+          "default": 6,
+          "minimum": 2,
+          "maximum": 10
+        },
+        "learning_rate": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0.01,
+          "maximum": 0.5
+        },
+        "l2_leaf_reg": {
+          "type": "number",
+          "default": 3.0,
+          "minimum": 0.0,
+          "maximum": 100.0
+        }
+      },
+      "representations": [
+        "dense_numeric"
+      ],
+      "supports_binary": true,
+      "supports_multiclass": true,
+      "predict_proba": true,
+      "fixed_settings": {
+        "task_type": "CPU",
+        "thread_count": 1,
+        "allow_writing_files": false
+      },
+      "profiles": [
+        "expanded"
+      ],
+      "legacy_candidates": [],
+      "candidates": [
+        {},
+        {
+          "depth": 4
+        },
+        {
+          "depth": 8
+        },
+        {
+          "iterations": 1000,
+          "learning_rate": 0.03
+        }
+      ]
+    },
     "hist_gradient_boosting": {
       "builder_id": "hist_gradient_boosting",
       "parameters": {
@@ -494,6 +807,32 @@
       }
     },
     "text_vectorizer": {
+      "hashing": {
+        "parameters": {
+          "field_mode": {
+            "type": "enum",
+            "choices": [
+              "shared",
+              "separate"
+            ]
+          },
+          "analyzer": {
+            "type": "enum",
+            "choices": [
+              "word",
+              "char"
+            ]
+          },
+          "n_features": {
+            "type": "enum",
+            "choices": [
+              16384,
+              65536,
+              262144
+            ]
+          }
+        }
+      },
       "tfidf": {
         "candidate_strategies": [
           {
@@ -533,7 +872,8 @@
             "type": "enum",
             "choices": [
               "word",
-              "char"
+              "char",
+              "word_char"
             ]
           },
           "ngram_min": {
@@ -559,8 +899,37 @@
         }
       }
     },
+    "text_encoder": {
+      "qwen3_embedding_0_6b": {
+        "model": "logistic_regression",
+        "supported_models": [
+          "logistic_regression",
+          "paired_logistic_regression"
+        ],
+        "parameters": {
+          "field_mode": {
+            "type": "enum",
+            "choices": [
+              "shared",
+              "separate"
+            ]
+          },
+          "lexical": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "char_tfidf"
+            ]
+          }
+        },
+        "weights_mb": 1190,
+        "device": "cpu or cuda"
+      }
+    },
     "image_transform": {
-      "flatten_scale": {}
+      "flatten_scale": {},
+      "gradient_cells": {},
+      "spatial_pyramid": {}
     }
   },
   "max_timeout_seconds": 600,

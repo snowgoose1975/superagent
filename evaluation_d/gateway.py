@@ -1,13 +1,13 @@
-"""保留 v1 的禁用网关供对照；v2 学校实现位于 school_gateway.py。"""
+"""Disabled v1 compatibility gateway. The school gateway is in school_gateway.py."""
 
 
 class DisabledGateway:
-    """暂未启用的模型网关。接入正式实现时保持相同调用入口。"""
+    """Compatibility class for the disabled model gateway."""
 
     def call_llm(self, *args, **kwargs):
-        raise NotImplementedError("真实模型网关尚未启用；当前不会发送请求或记录虚构 usage。")
+        raise NotImplementedError("This compatibility gateway is disabled.")
 
 
 def call_llm(*args, **kwargs):
-    """占位函数，后续可由符合文档接口的正式网关替换。"""
-    raise NotImplementedError("真实模型网关尚未启用；当前不会发送请求或记录虚构 usage。")
+    """Compatibility function for the disabled model gateway."""
+    raise NotImplementedError("This compatibility gateway is disabled.")

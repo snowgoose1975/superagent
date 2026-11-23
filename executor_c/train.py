@@ -1,8 +1,8 @@
-"""按固定计划训练表格分类模型，并生成验证集预测文件。
+"""Train a classifier from a validated plan and generate validation predictions.
 
-本模块只支持能力清单中公布的随机森林和逻辑回归。验证数据只用于
-生成预测，不读取验证标签，也不计算任何评分。通常由 executor.py
-在独立子进程中调用本文件。
+This module builds models from the capability registry and uses validation
+data for inference. The executor normally calls this module in a subprocess.
+
 """
 
 from __future__ import annotations
@@ -27,13 +27,13 @@ from executor_c.contracts import (
     validate_prediction_file,
     write_json,
 )
-from executor_c.model_factory import build_estimator
+from executor_c.model_factory import build_estimator, pack_encoder_features
 from executor_c.diagnostics import experiment_signature, make_diagnostics, write_worker_snapshot
 from data_b.modality_readers import combine_text_columns
 
 
 def _construct_model(plan: dict[str, Any], manifest: dict[str, Any]) -> Any:
-    """根据已校验计划构造白名单内的模型，不接受动态类名或代码。"""
+    """Construct a registered model from a validated plan."""
     try:
         return build_estimator(
             plan["model"],
@@ -44,34 +44,36 @@ def _construct_model(plan: dict[str, Any], manifest: dict[str, Any]) -> Any:
             modality=manifest.get("modality"),
         )
     except ValueError as exc:
-        raise ContractError("UNSUPPORTED_MODEL", "模型构造请求不受支持") from exc
+        raise ContractError("UNSUPPORTED_MODEL", "The model construction request is unsupported") from exc
 
 
 def _ordered_predictions(
     model: Any, X_valid: np.ndarray, class_ids: list[int]
 ) -> tuple[np.ndarray, np.ndarray]:
-    """将模型概率列按统一类别 id 升序排列，并检查输出形状和数值。"""
+    """Validate prediction shapes and values and order probabilities by class ID."""
     raw_pred = np.asarray(model.predict(X_valid))
+    if raw_pred.shape == (len(X_valid), 1):
+        raw_pred = raw_pred[:, 0]
     raw_prob = np.asarray(model.predict_proba(X_valid), dtype=np.float64)
     expected_shape = (len(X_valid), len(class_ids))
     if raw_pred.shape != (len(X_valid),) or raw_prob.shape != expected_shape:
-        raise RuntimeError("模型预测的数组形状与验证样本数或类别数不符")
+        raise RuntimeError("Prediction shape differs from the validation sample or class count")
     model_classes = np.asarray(model.classes_)
     if model_classes.ndim != 1 or len(model_classes) != len(class_ids):
-        raise RuntimeError("模型类别列表形状错误")
+        raise RuntimeError("The model class list has an invalid shape")
     try:
         column_for_id = {int(class_id): i for i, class_id in enumerate(model_classes.tolist())}
     except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError("模型返回了无法识别的类别 id") from exc
+        raise RuntimeError("The model returned an unrecognized class ID") from exc
     if len(column_for_id) != len(class_ids) or set(column_for_id) != set(class_ids):
-        raise RuntimeError("模型训练所得类别与数据清单类别不一致")
+        raise RuntimeError("The fitted model classes differ from the manifest")
     probs = raw_prob[:, [column_for_id[class_id] for class_id in class_ids]]
     if not np.isfinite(probs).all() or np.any(probs < 0.0) or np.any(probs > 1.0):
-        raise RuntimeError("模型概率包含非有限值或超出 [0, 1]")
+        raise RuntimeError("Model probabilities must be finite and in [0, 1]")
     if not np.allclose(probs.sum(axis=1), 1.0, rtol=0.0, atol=1e-6):
-        raise RuntimeError("模型输出的每行概率和不为 1")
+        raise RuntimeError("Model probabilities in each row must sum to 1")
     if not np.isin(raw_pred, class_ids).all():
-        raise RuntimeError("模型预测包含清单中不存在的类别 id")
+        raise RuntimeError("Model predictions contain a class ID absent from the manifest")
     return raw_pred.astype(np.int64), probs
 
 
@@ -88,7 +90,7 @@ def _write_predictions(
     predictions: np.ndarray,
     probabilities: np.ndarray,
 ) -> None:
-    """以 UTF-8 和协议规定的列顺序写预测 CSV，拒绝覆盖旧文件。"""
+    """Write a new UTF-8 predictions CSV with the specified column order."""
     with path.open("x", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream, lineterminator="\n")
         writer.writerow(["sample_id", "y_pred", *(f"p_{class_id}" for class_id in class_ids)])
@@ -97,7 +99,7 @@ def _write_predictions(
 
 
 def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
-    """读取输入、训练、保存并复核产物；run_dir 必须由调用方预先建立。"""
+    """Load inputs, train, save, and verify artifacts in an existing run_dir."""
     started = time.perf_counter()
     fitting_started = False
     phase = "input"
@@ -165,7 +167,47 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
         timings["input"] = time.perf_counter() - input_started
         snapshot("running")
         model = _construct_model(plan, manifest)
-        if manifest.get("representation") == "raw_text":
+        encoder_config = plan.get("pipeline", {}).get("text_encoder")
+        if encoder_config is not None:
+            from executor_c.text_encoder import EncoderError, LocalTextEncoder, encoder_manifest
+
+            phase = "text_encoding"
+            snapshot("running")
+            encoder_runtime = read_json(run_dir / "encoder_runtime.json")
+            if encoder_runtime.get("enabled") is not True:
+                raise ContractError("ENCODER_DISABLED", "The encoder is disabled for this experiment")
+            encoder = LocalTextEncoder()
+            columns = manifest["modality"]["text_columns"]
+            field_mode = encoder_config["params"]["field_mode"]
+            cache_dir = Path(encoder_runtime["feature_cache"])
+            stats = []
+            matrices = []
+            for partition, text in (("train", data.X_train), ("validation", data.X_valid)):
+                try:
+                    matrix, record = encoder.transform(
+                        text, columns, field_mode, cache_dir=cache_dir,
+                        source_hash=data.input_hashes[f"{partition}_features"], partition=partition,
+                    )
+                except EncoderError as exc:
+                    raise ContractError(exc.code, str(exc)) from exc
+                if encoder_config["params"].get("lexical") == "char_tfidf":
+                    matrix = pack_encoder_features(text, matrix)
+                matrices.append(matrix)
+                stats.append(record)
+            X_train, X_valid = matrices
+            write_json(run_dir / "encoder.json", {
+                "resource": encoder_manifest(), "packages": encoder.versions,
+                "device": encoder.device, "partitions": stats,
+                "weights": encoder_runtime["weights"],
+            })
+        elif plan["model"] == "catboost":
+            from executor_c.native_table import load_native_tables
+
+            X_train, X_valid, cat_columns = load_native_tables(
+                manifest_path.parent, len(data.X_train), len(data.X_valid)
+            )
+            model.set_params(cat_features=cat_columns)
+        elif manifest.get("representation") == "raw_text":
             modality = manifest["modality"]
             field_mode = plan["pipeline"]["text_vectorizer"]["params"]["field_mode"]
             if field_mode == "separate":
@@ -175,9 +217,9 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
                 X_valid = combine_text_columns(data.X_valid, modality["text_columns"])
         else:
             X_train, X_valid = data.X_train, data.X_valid
-        print(f"模型：{plan['model']}", flush=True)
+        print(f"Model: {plan['model']}", flush=True)
 
-        # fit 开始后发生的错误属于执行失败，而不是输入拒绝。
+        # Classify errors after fit starts as execution failures.
         fitting_started = True
         phase = "fit"
         snapshot("running")
@@ -197,7 +239,7 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
             for warning in caught[:20]
         ]
         snapshot("running")
-        print("训练完成。", flush=True)
+        print("Training complete.", flush=True)
         phase = "prediction"
         snapshot("running")
         predict_started = time.perf_counter()
@@ -208,24 +250,27 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
         snapshot("running")
         serialize_started = time.perf_counter()
         model_path = run_dir / "model.joblib"
-        # joblib 写入已独占创建的文件，避免静默覆盖历史产物。
+        # Write the joblib model to a new file to preserve historical artifacts.
         with model_path.open("xb") as stream:
             joblib.dump(model, stream)
         timings["serialize"] = time.perf_counter() - serialize_started
 
-        # 在同一 worker 进程重新加载并探测少量样本；跨进程加载由集成测试负责。
+        # Reload the model here for a small probe. Integration tests check loading in a new process.
         phase = "reload_check"
         snapshot("running")
         reload_started = time.perf_counter()
         restored = joblib.load(model_path)
         probe_size = min(len(data.X_valid), 5)
+        # Compare identical batch shapes: float32 kernels may round differently
+        # for a short probe than for the full validation matrix.
+        probe_pred, probe_prob = _ordered_predictions(model, X_valid[:probe_size], data.class_ids)
         restored_pred, restored_prob = _ordered_predictions(
             restored, X_valid[:probe_size], data.class_ids
         )
-        if not np.array_equal(restored_pred, predictions[:probe_size]) or not np.allclose(
-            restored_prob, probabilities[:probe_size], rtol=0.0, atol=1e-12
+        if not np.array_equal(restored_pred, probe_pred) or not np.allclose(
+            restored_prob, probe_prob, rtol=0.0, atol=1e-12
         ):
-            raise RuntimeError("保存后重新加载的模型预测与原模型不一致")
+            raise RuntimeError("The saved model predictions changed after reloading")
         timings["reload_check"] = time.perf_counter() - reload_started
 
         prediction_path = run_dir / "predictions.csv"
@@ -244,7 +289,7 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
             },
         )
         snapshot("success")
-        print("预测与模型产物已保存并通过检查。", flush=True)
+        print("Predictions and model artifacts were saved and verified.", flush=True)
     except ContractError as exc:
         status = (
             "rejected"
@@ -288,7 +333,7 @@ def _effective_iterations(model: Any) -> int | None:
 
 
 def _record_error(run_dir: Path, status: str, code: str, message: str) -> None:
-    """尽力写入机器可读错误；保留 stderr traceback 供开发排查。"""
+    """Record a structured error when possible and keep the traceback in stderr."""
     print(traceback.format_exc(), file=sys.stderr, end="")
     try:
         write_json(
@@ -296,16 +341,16 @@ def _record_error(run_dir: Path, status: str, code: str, message: str) -> None:
             {"status": status, "error": {"code": code, "message": message}},
         )
     except Exception:
-        print("无法写入 worker_error.json；原始异常见上述 traceback。", file=sys.stderr)
+        print("Cannot write worker_error.json. See the traceback above.", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="按固定计划训练白名单内的分类模型")
-    parser.add_argument("--plan", required=True, type=Path, help="实验计划 JSON 的绝对路径")
+    parser = argparse.ArgumentParser(description="Train a registered classifier from a validated plan")
+    parser.add_argument("--plan", required=True, type=Path, help="Absolute path to the experiment plan JSON")
     parser.add_argument(
-        "--data-manifest", required=True, type=Path, help="B 数据清单 JSON 的绝对路径"
+        "--data-manifest", required=True, type=Path, help="Absolute path to the data manifest JSON"
     )
-    parser.add_argument("--run-dir", required=True, type=Path, help="调用方已创建的本次运行目录")
+    parser.add_argument("--run-dir", required=True, type=Path, help="Existing directory for this run")
     args = parser.parse_args(argv)
     try:
         run(args.plan, args.data_manifest, args.run_dir)

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import csv
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,23 +35,23 @@ def _load_test_config(config_path: str | Path, expected_task_id: str) -> tuple[d
     path = Path(config_path).expanduser().resolve(strict=True)
     config = read_json(path, error_code="FINAL_TEST_CONFIG_INVALID")
     if set(config) != _TEST_CONFIG_FIELDS or config.get("schema_version") != "1.0":
-        raise ValueError("test config 必须符合 schema 1.0 且字段完整")
+        raise ValueError("The test config must contain all schema 1.0 fields")
     if config.get("task_id") != expected_task_id:
-        raise ValueError("test config 的 task_id 与冻结 bundle 不一致")
+        raise ValueError("The test task_id does not match the frozen bundle")
     if (
         not isinstance(config.get("source_root"), str)
         or not config["source_root"]
         or type(config.get("n_samples")) is not int
         or config["n_samples"] < 1
     ):
-        raise ValueError("test config 的 source_root/n_samples 不合法")
+        raise ValueError("The test source_root or n_samples is invalid")
     root = (path.parent / config["source_root"]).resolve(strict=True)
     if not root.is_dir():
-        raise ValueError("test config 的 source_root 必须是现存目录")
+        raise ValueError("The test source_root must be an existing directory")
     features = resolve_data_path(root, config["features_path"])
     labels = resolve_data_path(root, config["labels_path"])
     if features == labels:
-        raise ValueError("test 特征和标签必须是不同文件")
+        raise ValueError("Test features and labels must be in separate files")
     return config, features, labels
 
 
@@ -62,19 +65,19 @@ def _load_encoded_labels(labels_path: Path, mapping: dict[str, Any], class_ids: 
         or [item.get("id") if isinstance(item, dict) else None for item in classes]
         != class_ids
     ):
-        raise ValueError("冻结 label_mapping 与 bundle 的类别定义不一致")
+        raise ValueError("The frozen label mapping and bundle define different classes")
     tokens = [typed_category_token(value) for value in label_values]
     if any(not isinstance(token, str) for token in tokens) or len(set(tokens)) != len(tokens):
-        raise ValueError("冻结 label_mapping 的原始类别值无效或重复")
+        raise ValueError("The frozen label mapping contains invalid or duplicate source class values")
     label_to_id = {token: class_id for token, class_id in zip(tokens, class_ids, strict=True)}
     raw = read_npy_array(labels_path)
     if raw.ndim != 1:
-        raise ValueError("test 标签必须是一维数组")
+        raise ValueError("Test labels must be a one-dimensional array")
     encoded: list[int] = []
     for value in raw:
         token = typed_category_token(value)
         if not isinstance(token, str) or token not in label_to_id:
-            raise ValueError("test 标签包含冻结 label_mapping 未声明的类别")
+            raise ValueError("Test labels contain a class absent from the frozen label mapping")
         encoded.append(label_to_id[token])
     return encoded
 
@@ -85,24 +88,24 @@ def _read_predictions(path: Path, class_ids: list[int]) -> tuple[list[int], list
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
             reader = csv.reader(stream)
             if next(reader, None) != expected_header:
-                raise ValueError("test 预测 CSV 表头与冻结类别不匹配")
+                raise ValueError("The test prediction CSV header does not match the frozen classes")
             rows = list(reader)
     except (OSError, UnicodeError, csv.Error) as exc:
-        raise ValueError("无法读取 test 预测 CSV") from exc
+        raise ValueError("Cannot read the test prediction CSV") from exc
     if not rows:
-        raise ValueError("test 预测不能为空")
+        raise ValueError("Test predictions must be nonempty")
     y_pred: list[int] = []
     probabilities: list[list[float]] = []
     for index, row in enumerate(rows):
         if len(row) != len(expected_header) or row[0] != f"test_{index:09d}":
-            raise ValueError("test 预测行结构或顺序标识无效")
+            raise ValueError("Test prediction rows or ordered sample IDs are invalid")
         try:
             label = int(row[1])
             probability = [float(value) for value in row[2:]]
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("test 预测类别或概率不是合法数字") from exc
+            raise ValueError("Test predictions contain an invalid class number or probability") from exc
         if str(label) != row[1] or label not in class_ids:
-            raise ValueError("test 预测包含非法类别")
+            raise ValueError("Test predictions contain an invalid class")
         y_pred.append(label)
         probabilities.append(probability)
     return y_pred, probabilities
@@ -112,11 +115,14 @@ def evaluate_frozen_bundle(
     bundle_path: str | Path,
     test_config_path: str | Path,
     output_dir: str | Path,
+    *,
+    pretrained: str = "cache-only",
+    encoder_timeout: float | None = 600,
 ) -> dict[str, Any]:
     """Predict and score test rows without fitting or changing the frozen model."""
     destination = Path(output_dir).expanduser().resolve()
     if not destination.is_dir():
-        raise ValueError("test 报告目录必须已存在")
+        raise ValueError("The test report directory must already exist")
     report_path = destination / "test_evaluation.json"
     predictions_path = destination / "test_predictions.csv"
     bundle_file = Path(bundle_path).expanduser().resolve()
@@ -131,11 +137,11 @@ def evaluate_frozen_bundle(
             or bundle.get("selection", {}).get("partition") != "validation"
             or bundle.get("training_policy", {}).get("refit_on_validation") is not False
         ):
-            raise ValueError("只允许评估已冻结的 validation 最优 final bundle")
+            raise ValueError("Test evaluation requires a final bundle frozen after validation selection")
         classes = bundle.get("classes")
         class_ids = [item.get("id") if isinstance(item, dict) else None for item in classes]
         if class_ids != list(range(len(class_ids))) or len(class_ids) < 2:
-            raise ValueError("冻结 bundle 的类别 ID 必须是完整的 0..K-1 序列")
+            raise ValueError("Frozen class IDs must be the complete sequence 0..K-1")
         metric = validate_metric_spec(
             {
                 "name": bundle["selection"].get("metric"),
@@ -151,8 +157,8 @@ def evaluate_frozen_bundle(
                 requested_test_config.get("kind") != "task_directory"
                 or requested_test_config.get("task_id") != bundle["task_id"]
             ):
-                raise ValueError("自动 test 描述与冻结 bundle 不一致")
-            # CSV/多数组 test 的转换也必须发生在 final bundle 冻结之后。
+                raise ValueError("The automatic test descriptor does not match the frozen bundle")
+            # Materialize CSV or multi-array test data only after freezing the final bundle.
             test_input_dir = destination / "test_input"
             test_config_path = materialize_final_test(test_config_path, test_input_dir)
             source_inputs = read_json(test_input_dir / "test_source.json")
@@ -165,7 +171,22 @@ def evaluate_frozen_bundle(
         mapping_path = resolve_data_path(bundle_file.parent, bundle["artifacts"]["label_mapping_path"])
         mapping = read_json(mapping_path, error_code="FINAL_BUNDLE_INVALID")
 
-        predict_bundle(bundle_file, features_path, predictions_path, id_prefix="test")
+        if "encoder.json" in bundle["hashes"]:
+            try:
+                completed = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve().parents[1] / "predict.py"),
+                     "--bundle", str(bundle_file), "--features", str(features_path),
+                     "--output", str(predictions_path), "--id-prefix", "test",
+                     "--pretrained", pretrained],
+                    timeout=encoder_timeout, capture_output=encoder_timeout is not None, check=False,
+                    env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("Local encoder inference timed out on the final test partition") from exc
+            if completed.returncode != 0:
+                raise ValueError("Final test encoder inference failed. Check dependencies, the cache, and the frozen manifest.")
+        else:
+            predict_bundle(bundle_file, features_path, predictions_path, id_prefix="test")
         y_true = _load_encoded_labels(labels_path, mapping, class_ids)
         y_pred, probabilities = _read_predictions(predictions_path, class_ids)
         if (
@@ -173,7 +194,7 @@ def evaluate_frozen_bundle(
             or len(y_pred) != config["n_samples"]
             or len(y_true) != len(y_pred)
         ):
-            raise ValueError("test 特征/标签行数与 n_samples 声明不一致")
+            raise ValueError("Test feature or label row count differs from n_samples")
         metric_value = score_predictions(metric["name"], y_true, y_pred, probabilities, class_ids)
         accuracy = score_predictions("accuracy", y_true, y_pred, probabilities, class_ids)
         if (
@@ -181,7 +202,7 @@ def evaluate_frozen_bundle(
             or sha256_file(labels_path) != labels_hash
             or sha256_file(Path(test_config_path).expanduser().resolve(strict=True)) != config_hash
         ):
-            raise ValueError("test 输入或配置在评估期间发生变化")
+            raise ValueError("Test inputs or configuration changed during evaluation")
         report = {
             "schema_version": "1.0",
             "task_id": bundle["task_id"],
@@ -229,7 +250,7 @@ def evaluate_frozen_bundle(
             pass
         except OSError as report_exc:
             raise FinalTestError(
-                f"{exc}；test 失败报告也无法写入：{report_exc}"
+                f"{exc}. Could not write the test failure report: {report_exc}"
             ) from exc
         raise FinalTestError(str(exc)) from exc
 
@@ -237,7 +258,7 @@ def evaluate_frozen_bundle(
 def format_test_result(report: dict[str, Any]) -> list[str]:
     """Terminal lines for the configured metric and the familiar accuracy score."""
     if report.get("status") != "success":
-        return [f"[Test] 失败：{report.get('error', {}).get('message', '未知错误')}"]
+        return [f"[Test] Failed: {report.get('error', {}).get('message', 'Unknown error')}"]
     n_samples = report["n_samples"]
     metric = report["metric"]
     lines = []

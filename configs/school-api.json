@@ -1,8 +1,10 @@
 {
   "url": "https://aigc-api.hkust-gz.edu.cn/api/v2/chat/completions",
   "model": "DeepSeek-V4.1-Flash",
-  "input_cny_per_million": "0.50",
-  "output_cny_per_million": "2.00",
+  "pricing_profile": "deepseek-v4.1-flash-offpeak-2026-10-21",
+  "pricing_tier": "published off-peak, cache-miss reference rates",
+  "input_cny_per_million": "1.007880",
+  "output_cny_per_million": "4.031520",
   "max_tokens": 1024,
   "max_input_tokens": 16384,
   "timeout": 90

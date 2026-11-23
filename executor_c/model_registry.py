@@ -6,11 +6,16 @@ from __future__ import annotations
 
 import copy
 import math
+from importlib.util import find_spec
 from dataclasses import dataclass
 from typing import Any
 
 CAPABILITY_SCHEMA_VERSION = "2.0"
-REGISTRY_VERSION = "1.1"
+REGISTRY_VERSION = "1.4"
+TEXT_ENCODER_ID = "qwen3_embedding_0_6b"
+PAIRWISE_MODEL_ID = "paired_logistic_regression"
+MAX_RBF_TRAIN_ROWS = 12_000
+MAX_RBF_TRAIN_ELEMENTS = 2_000_000
 MAX_TIMEOUT_SECONDS = 600
 
 
@@ -112,6 +117,27 @@ MODELS: dict[str, Model] = {
             {"C": 3.0, "max_iter": 1500},
         ),
     ),
+    PAIRWISE_MODEL_ID: Model(
+        PAIRWISE_MODEL_ID, PAIRWISE_MODEL_ID,
+        {
+            "C": Parameter("number", 1.0, 0.001, 100.0),
+            "max_iter": Parameter("integer", 1000, 100, 2000),
+        },
+        {"solver": "lbfgs", "fit_intercept": False},
+        representations=("raw_text",),
+        candidates=({}, {"C": 0.3}, {"C": 3.0}),
+    ),
+    "rbf_svc": Model(
+        "rbf_svc", "rbf_svc",
+        {
+            "C": Parameter("number", 10.0, 0.001, 100.0),
+            "gamma": Parameter("number", 0.01, 0.000001, 10.0),
+            "class_weight": Parameter("optional_enum", None, choices=(None, "balanced")),
+        },
+        {"calibration": "sigmoid", "cv": 3, "cache_size_mb": 96},
+        representations=("dense_numeric", "image_tensor"),
+        candidates=({}, {"C": 1.0}, {"gamma": 0.001}, {"gamma": 0.1}),
+    ),
     "multinomial_nb": Model(
         "multinomial_nb",
         "multinomial_nb",
@@ -145,6 +171,52 @@ MODELS: dict[str, Model] = {
             {"n_estimators": 200, "max_depth": 16, "min_samples_leaf": 2},
             {"n_estimators": 400, "max_depth": 16, "min_samples_leaf": 2},
         ),
+    ),
+    "sgd_logistic": Model(
+        "sgd_logistic", "sgd_logistic",
+        {
+            "alpha": Parameter("number", 0.0001, 0.000001, 0.1),
+            "class_weight": Parameter("optional_enum", None, choices=(None, "balanced")),
+        },
+        {"loss": "log_loss", "max_iter": 2000},
+        representations=("raw_text",),
+        candidates=({}, {"alpha": 0.00001}, {"alpha": 0.001}, {"class_weight": "balanced"}),
+    ),
+    "linear_svc": Model(
+        "linear_svc", "linear_svc",
+        {
+            "C": Parameter("number", 1.0, 0.001, 100.0),
+            "class_weight": Parameter("optional_enum", None, choices=(None, "balanced")),
+        },
+        {"calibration": "sigmoid", "cv": 3},
+        representations=("raw_text", "dense_numeric"),
+        candidates=({"C": 1.0}, {"C": 0.1}, {"C": 5.0}, {"C": 1.0, "class_weight": "balanced"}),
+    ),
+    "xgboost": Model(
+        "xgboost", "xgboost",
+        {
+            "n_estimators": Parameter("integer", 400, 25, 2000),
+            "max_depth": Parameter("integer", 5, 1, 12),
+            "learning_rate": Parameter("number", 0.05, 0.01, 0.5),
+            "subsample": Parameter("number", 0.85, 0.3, 1.0),
+            "colsample_bytree": Parameter("number", 0.85, 0.3, 1.0),
+            "reg_lambda": Parameter("number", 1.0, 0.0, 100.0),
+        },
+        {"tree_method": "hist", "device": "cpu", "n_jobs": 1},
+        candidates=({}, {"max_depth": 3}, {"max_depth": 7},
+                    {"n_estimators": 800, "learning_rate": 0.03}),
+    ),
+    "catboost": Model(
+        "catboost", "catboost",
+        {
+            "iterations": Parameter("integer", 500, 25, 2500),
+            "depth": Parameter("integer", 6, 2, 10),
+            "learning_rate": Parameter("number", 0.05, 0.01, 0.5),
+            "l2_leaf_reg": Parameter("number", 3.0, 0.0, 100.0),
+        },
+        {"task_type": "CPU", "thread_count": 1, "allow_writing_files": False},
+        candidates=({}, {"depth": 4}, {"depth": 8},
+                    {"iterations": 1000, "learning_rate": 0.03}),
     ),
     "hist_gradient_boosting": Model(
         "hist_gradient_boosting", "hist_gradient_boosting",
@@ -224,7 +296,7 @@ def model_capability(model_id: str) -> dict[str, Any]:
         "parameters": {name: spec.as_dict() for name, spec in model.parameters.items()},
         "representations": list(model.representations),
         "supports_binary": True,
-        "supports_multiclass": True,
+        "supports_multiclass": model_id != PAIRWISE_MODEL_ID,
         "predict_proba": True,
         "fixed_settings": copy.deepcopy(model.fixed_settings),
         "profiles": list(model.profiles),
@@ -254,6 +326,13 @@ def capabilities() -> dict[str, Any]:
                 },
             },
             "text_vectorizer": {
+                "hashing": {
+                    "parameters": {
+                        "field_mode": {"type": "enum", "choices": ["shared", "separate"]},
+                        "analyzer": {"type": "enum", "choices": ["word", "char"]},
+                        "n_features": {"type": "enum", "choices": [16384, 65536, 262144]},
+                    },
+                },
                 "tfidf": {
                     "candidate_strategies": [
                         {"field_mode": "shared", "analyzer": "word", "ngram_min": 1, "ngram_max": 1},
@@ -263,7 +342,7 @@ def capabilities() -> dict[str, Any]:
                     ],
                     "parameters": {
                         "field_mode": {"type": "enum", "choices": ["shared", "separate"]},
-                        "analyzer": {"type": "enum", "choices": ["word", "char"]},
+                        "analyzer": {"type": "enum", "choices": ["word", "char", "word_char"]},
                         "ngram_min": {"type": "integer", "minimum": 1, "maximum": 5},
                         "ngram_max": {"type": "integer", "minimum": 1, "maximum": 5},
                         "max_features": {"type": "integer", "minimum": 100, "maximum": 100000},
@@ -271,7 +350,19 @@ def capabilities() -> dict[str, Any]:
                     }
                 }
             },
-            "image_transform": {"flatten_scale": {}},
+            "text_encoder": {
+                TEXT_ENCODER_ID: {
+                    "model": "logistic_regression",
+                    "supported_models": ["logistic_regression", PAIRWISE_MODEL_ID],
+                    "parameters": {
+                        "field_mode": {"type": "enum", "choices": ["shared", "separate"]},
+                        "lexical": {"type": "enum", "choices": ["none", "char_tfidf"]},
+                    },
+                    "weights_mb": 1190,
+                    "device": "cpu or cuda",
+                }
+            },
+            "image_transform": {"flatten_scale": {}, "gradient_cells": {}, "spatial_pyramid": {}},
         },
         "max_timeout_seconds": MAX_TIMEOUT_SECONDS,
         "representations": ["dense_numeric", "raw_text", "image_tensor"],
@@ -329,7 +420,7 @@ def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
         raise ValueError("pipeline must be an object")
     allowed = {"feature_selector"}
     if representation == "raw_text":
-        allowed.add("text_vectorizer")
+        allowed.update({"text_vectorizer", "text_encoder"})
     elif representation == "image_tensor":
         allowed.add("image_transform")
     elif representation != "dense_numeric":
@@ -362,15 +453,50 @@ def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
     else:
         raise ValueError("feature_selector name is not supported")
 
-    if representation == "raw_text":
+    if representation == "raw_text" and "text_encoder" in pipeline:
+        encoder = pipeline["text_encoder"]
+        if (
+            "text_vectorizer" in pipeline
+            or not isinstance(encoder, dict)
+            or set(encoder) != {"name", "params"}
+            or encoder["name"] != TEXT_ENCODER_ID
+            or not isinstance(encoder["params"], dict)
+            or set(encoder["params"]) - {"field_mode", "lexical"}
+        ):
+            raise ValueError("invalid text encoder pipeline")
+        mode = encoder["params"].get("field_mode", "separate")
+        if mode not in ("shared", "separate"):
+            raise ValueError("text encoder field_mode must be shared or separate")
+        normalized.pop("text_vectorizer")
+        lexical = encoder["params"].get("lexical", "none")
+        if lexical not in ("none", "char_tfidf"):
+            raise ValueError("text encoder lexical must be none or char_tfidf")
+        params = {"field_mode": mode}
+        if lexical != "none":
+            params["lexical"] = lexical
+        normalized["text_encoder"] = {"name": TEXT_ENCODER_ID, "params": params}
+    elif representation == "raw_text":
         text = pipeline.get("text_vectorizer", normalized["text_vectorizer"])
         if (
             not isinstance(text, dict)
             or set(text) != {"name", "params"}
-            or text["name"] != "tfidf"
+            or text["name"] not in ("tfidf", "hashing")
         ):
-            raise ValueError("raw_text requires the registered tfidf vectorizer")
+            raise ValueError("raw_text requires a registered text vectorizer")
         params = text["params"]
+        if text["name"] == "hashing":
+            if not isinstance(params, dict) or set(params) - {"field_mode", "analyzer", "n_features"}:
+                raise ValueError("unsupported hashing parameters")
+            values = {"field_mode": "shared", "analyzer": "word", "n_features": 65536, **params}
+            if (
+                values["field_mode"] not in ("shared", "separate")
+                or values["analyzer"] not in ("word", "char")
+                or type(values["n_features"]) is not int
+                or values["n_features"] not in (16384, 65536, 262144)
+            ):
+                raise ValueError("unsupported hashing field mode, analyzer or dimensionality")
+            normalized["text_vectorizer"] = {"name": "hashing", "params": values}
+            return normalized
         keys = {
             "field_mode", "analyzer", "ngram_min", "ngram_max", "max_features", "min_df"
         }
@@ -382,8 +508,8 @@ def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
             "shared", "separate"
         }:
             raise ValueError("tfidf field_mode must be shared or separate")
-        if not isinstance(values["analyzer"], str) or values["analyzer"] not in {"word", "char"}:
-            raise ValueError("tfidf analyzer must be word or char")
+        if not isinstance(values["analyzer"], str) or values["analyzer"] not in {"word", "char", "word_char"}:
+            raise ValueError("tfidf analyzer must be word, char or word_char")
         for field, low, high in (
             ("ngram_min", 1, 5),
             ("ngram_max", 1, 5),
@@ -394,17 +520,112 @@ def normalize_pipeline(representation: str, pipeline: Any) -> dict[str, Any]:
                 raise ValueError(f"tfidf {field} is outside the supported integer range")
         if values["ngram_min"] > values["ngram_max"]:
             raise ValueError("tfidf ngram_min cannot exceed ngram_max")
+        if values["analyzer"] == "word_char":
+            values.update(ngram_min=1, ngram_max=5)
         normalized["text_vectorizer"] = {"name": "tfidf", "params": values}
     elif representation == "image_tensor":
         image = pipeline.get("image_transform", normalized["image_transform"])
         if (
             not isinstance(image, dict)
             or set(image) != {"name", "params"}
-            or image["name"] != "flatten_scale"
+            or image["name"] not in ("flatten_scale", "gradient_cells", "spatial_pyramid")
             or image["params"] != {}
         ):
-            raise ValueError("image_tensor requires the fixed flatten_scale transform")
+            raise ValueError("unsupported image transform")
+        normalized["image_transform"] = copy.deepcopy(image)
     return normalized
+
+
+def available_text_encoders(catalogue: dict[str, Any]) -> dict[str, Any]:
+    models = catalogue.get("pipeline_components", {}).get("text_encoder", {})
+    return {
+        name: metadata for name, metadata in models.items()
+        if isinstance(metadata, dict) and metadata.get("availability") in {"cached", "downloadable"}
+    }
+
+
+def encoder_pipeline(n_features: int) -> dict[str, Any]:
+    return normalize_pipeline("raw_text", {
+        "text_encoder": {
+            "name": TEXT_ENCODER_ID,
+            "params": {"field_mode": "separate" if n_features > 1 else "shared"},
+        }
+    })
+
+
+def paired_text_pipeline() -> dict[str, Any]:
+    """Use the same vocabulary in both columns of a binary preference pair."""
+    pipeline = default_pipeline("raw_text")
+    pipeline["text_vectorizer"]["params"].update(
+        field_mode="separate", analyzer="word_char", min_df=2, max_features=40_000,
+    )
+    return normalize_pipeline("raw_text", pipeline)
+
+
+def validate_model_pipeline(model_id: str, pipeline: dict[str, Any]) -> None:
+    encoder = pipeline.get("text_encoder")
+    if model_id == PAIRWISE_MODEL_ID:
+        if encoder is not None:
+            if encoder["params"] != {"field_mode": "separate", "lexical": "char_tfidf"}:
+                raise ValueError("paired_logistic_regression requires separate Qwen plus character TF-IDF")
+        else:
+            vectorizer = pipeline.get("text_vectorizer", {})
+            if vectorizer.get("name") != "tfidf" or vectorizer["params"]["field_mode"] != "separate":
+                raise ValueError("paired_logistic_regression requires TF-IDF with separate input fields")
+    elif encoder is not None and model_id != "logistic_regression":
+        raise ValueError("text_encoder requires logistic_regression or paired_logistic_regression")
+    if model_id == "rbf_svc" and pipeline.get("image_transform", {}).get("name") == "flatten_scale":
+        raise ValueError("rbf_svc requires an image feature transform with bounded output width")
+
+
+def runtime_capabilities(
+    representation: str, *,
+    min_class_count: int,
+    native_table: bool,
+    performance: bool,
+    pairwise_text: bool = False,
+    n_train: int | None = None,
+    n_features: int | None = None,
+    image_shape: list[int] | None = None,
+) -> dict[str, Any]:
+    result = capabilities()
+    optional_modules = {"catboost": "catboost", "xgboost": "xgboost"}
+    rbf_width = n_features
+    if representation == "image_tensor" and image_shape:
+        height, width = image_shape[:2]
+        channels = image_shape[2] if len(image_shape) == 3 else 1
+        scales = {(min(height, scale), min(width, scale)) for scale in (1, 2, 4, 8)}
+        rbf_width = max(
+            min(height, 4) * min(width, 4) * (9 + 2 * channels),
+            sum(rows * cols for rows, cols in scales) * (2 * channels + 2),
+        )
+    rbf_size_supported = (
+        n_train is not None and 1 <= n_train <= MAX_RBF_TRAIN_ROWS
+        and rbf_width is not None and 1 <= n_train * rbf_width <= MAX_RBF_TRAIN_ELEMENTS
+    )
+    result["models"] = {
+        model_id: spec for model_id, spec in result["models"].items()
+        if representation in MODELS[model_id].representations
+        and (
+            performance or model_id not in {
+                "catboost", "xgboost", "linear_svc", "rbf_svc", "sgd_logistic", PAIRWISE_MODEL_ID,
+            }
+        )
+        and (model_id not in optional_modules or find_spec(optional_modules[model_id]) is not None)
+        and (model_id != "catboost" or native_table)
+        and (model_id not in {"linear_svc", "rbf_svc"} or min_class_count >= 3)
+        and (model_id != "rbf_svc" or rbf_size_supported)
+        and (model_id != PAIRWISE_MODEL_ID or pairwise_text)
+    }
+    if PAIRWISE_MODEL_ID not in result["models"]:
+        result["pipeline_components"]["text_encoder"][TEXT_ENCODER_ID]["supported_models"].remove(
+            PAIRWISE_MODEL_ID,
+        )
+    if not performance:
+        result["pipeline_components"]["image_transform"].pop("spatial_pyramid", None)
+        result["pipeline_components"]["text_vectorizer"].pop("hashing", None)
+        result["pipeline_components"]["image_transform"].pop("gradient_cells", None)
+    return result
 
 
 def models_for_profile(profile: str, representations: list[str] | None = None) -> list[str]:
@@ -412,6 +633,7 @@ def models_for_profile(profile: str, representations: list[str] | None = None) -
     return [
         model_id for model_id, model in MODELS.items()
         if profile in model.profiles and allowed.intersection(model.representations)
+        and model_id not in {"catboost", "xgboost", "linear_svc", "rbf_svc", "sgd_logistic", PAIRWISE_MODEL_ID}
     ]
 
 

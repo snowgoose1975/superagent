@@ -21,7 +21,7 @@ def validate_metric_spec(value: Any) -> dict[str, Any]:
         or value["greater_is_better"] is not SUPPORTED_METRICS[value["name"]]
     ):
         raise ValueError(
-            "primary_metric 必须是 accuracy/f1_macro（越大越好）或 log_loss（越小越好）"
+            "primary_metric must be accuracy or f1_macro (maximize), or log_loss (minimize)"
         )
     return {"name": value["name"], "greater_is_better": value["greater_is_better"]}
 
@@ -42,18 +42,18 @@ def score_predictions(
     class_ids: list[int],
 ) -> float:
     if not y_true or len(y_true) != len(y_pred) or len(y_true) != len(probabilities):
-        raise ValueError("标签、预测类别和概率行数必须相同且非空")
+        raise ValueError("Label, prediction, and probability arrays must have the same nonzero row count")
     if class_ids != list(range(len(class_ids))) or len(class_ids) < 2:
-        raise ValueError("class_ids 必须是完整的 0..K-1 类别序列")
+        raise ValueError("class_ids must be the complete sequence 0..K-1")
     if any(label not in class_ids for label in y_true + y_pred):
-        raise ValueError("标签或预测包含未知类别")
+        raise ValueError("Labels or predictions contain an unknown class")
     if any(
         len(row) != len(class_ids)
         or any(not math.isfinite(value) or value < 0 or value > 1 for value in row)
         or abs(math.fsum(row) - 1.0) > 1e-6
         for row in probabilities
     ):
-        raise ValueError("概率矩阵的列数、范围、有限性或行和不合法")
+        raise ValueError("Probability columns, finite range, or row sums are invalid")
 
     if name == "accuracy":
         return sum(actual == predicted for actual, predicted in zip(y_true, y_pred, strict=True)) / len(y_true)
@@ -72,4 +72,4 @@ def score_predictions(
             math.log(max(probabilities[index][actual], epsilon))
             for index, actual in enumerate(y_true)
         ) / len(y_true)
-    raise ValueError("不支持的 primary metric")
+    raise ValueError("Unsupported primary metric")

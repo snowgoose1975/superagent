@@ -74,27 +74,27 @@ def _safe_id(value: Any, field: str) -> str:
     import re
 
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) or ".." in value:
-        raise ValueError(f"{field} 必须是 1–64 位安全 ASCII 编号")
+        raise ValueError(f"{field} must be a safe ASCII identifier of 1 to 64 characters")
     return value
 
 
 def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     if not isinstance(spec, dict) or set(spec) != _TASK_FIELDS:
-        raise ValueError("2.0 任务配置字段缺失或包含未支持字段")
+        raise ValueError("TaskSpec 2.0 is missing fields or contains unsupported fields")
     if spec["schema_version"] != "2.0":
-        raise ValueError("模态任务必须使用 TaskSpec 2.0")
+        raise ValueError("Text and image tasks require TaskSpec 2.0")
     task_id = _safe_id(spec["task_id"], "task_id")
     data_version = _safe_id(spec["data_version"], "data_version")
     source_root = Path(spec["source_root"]).expanduser()
     if not source_root.is_absolute() or not source_root.is_dir():
-        raise ValueError("source_root 必须是现存目录的绝对路径")
+        raise ValueError("source_root must be an existing absolute directory")
     modality = spec["modality"]
     if not isinstance(modality, dict) or not isinstance(modality.get("kind"), str):
-        raise ValueError("modality 必须声明 kind")
+        raise ValueError("modality must declare kind")
     if spec["source_format"] == "text_array_package" and modality.get("kind") == "text":
         expected = {"kind", "text_columns", "max_characters"}
         if set(modality) != expected:
-            raise ValueError("文本 modality 字段不受支持")
+            raise ValueError("Unsupported text modality fields")
         columns = modality["text_columns"]
         if (
             not isinstance(columns, list)
@@ -102,12 +102,12 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
             or any(not isinstance(name, str) or not name.strip() for name in columns)
             or len(set(columns)) != len(columns)
         ):
-            raise ValueError("text_columns 必须是 1–8 个唯一非空列名")
+            raise ValueError("text_columns must list 1 to 8 unique non-empty column names")
         if (
             type(modality["max_characters"]) is not int
             or not 1 <= modality["max_characters"] <= 100_000
         ):
-            raise ValueError("max_characters 必须在 1–100000 之间")
+            raise ValueError("max_characters must be between 1 and 100000")
         modality = {
             "kind": "text",
             "text_columns": list(columns),
@@ -116,7 +116,7 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     elif spec["source_format"] == "image_array_package" and modality.get("kind") == "image":
         expected = {"kind", "image_shape", "channel_layout", "value_range"}
         if set(modality) != expected:
-            raise ValueError("图像 modality 字段不受支持")
+            raise ValueError("Unsupported image modality fields")
         shape, layout, value_range = validate_image_spec(
             modality["image_shape"], modality["channel_layout"], modality["value_range"]
         )
@@ -127,11 +127,11 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
             "value_range": list(value_range),
         }
     else:
-        raise ValueError("source_format 与 modality.kind 必须声明为文本或图像数组")
+        raise ValueError("source_format and modality.kind must identify text or image arrays")
     validate_metric_spec(spec["primary_metric"])
     partitions = spec["partitions"]
     if not isinstance(partitions, dict) or set(partitions) != {"train", "validation"}:
-        raise ValueError("partitions 必须且只能包含 train 和 validation")
+        raise ValueError("partitions must contain only train and validation")
     for name, split in partitions.items():
         if (
             not isinstance(split, dict)
@@ -139,7 +139,7 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
             or type(split["n_samples"]) is not int
             or split["n_samples"] < 1
         ):
-            raise ValueError(f"{name} 必须声明合法 features_path/labels_path/n_samples")
+            raise ValueError(f"{name} requires valid features_path, labels_path, and n_samples")
         for key in ("features_path", "labels_path"):
             relative = split[key]
             if (
@@ -147,14 +147,14 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
                 or not relative
                 or "\\" in relative
             ):
-                raise ValueError(f"{name}.{key} 必须是 source_root 内相对路径")
+                raise ValueError(f"{name}.{key} must be relative to source_root")
             path = Path(relative)
             if path.is_absolute() or ".." in path.parts:
-                raise ValueError(f"{name}.{key} 必须是 source_root 内相对路径")
+                raise ValueError(f"{name}.{key} must be relative to source_root")
             if not (source_root / path).resolve().is_relative_to(source_root.resolve()):
-                raise ValueError(f"{name}.{key} 越出 source_root")
+                raise ValueError(f"{name}.{key} escapes source_root")
             if not (source_root / path).is_file():
-                raise ValueError(f"{name}.{key} 文件不存在")
+                raise ValueError(f"{name}.{key} file does not exist")
     values, names = spec["label_values"], spec["label_names"]
     if (
         not isinstance(values, list)
@@ -164,25 +164,25 @@ def _validate_spec(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
         or any(not isinstance(name, str) or not name.strip() for name in names)
         or len(set(names)) != len(names)
     ):
-        raise ValueError("label_values/label_names 必须等长、唯一且至少包含两个类别")
+        raise ValueError("label_values and label_names must have equal lengths, unique values, and at least two classes")
     label_tokens = [typed_category_token(item) for item in values]
     if any(not isinstance(token, str) for token in label_tokens) or len(
         set(label_tokens)
     ) != len(label_tokens):
-        raise ValueError("label_values 必须是唯一、非缺失的标量")
+        raise ValueError("label_values must be unique non-missing scalars")
     policy = spec["train_policy"]
     if not isinstance(policy, dict) or set(policy) != {
         "max_trials",
         "random_seed",
         "timeout_seconds",
     }:
-        raise ValueError("train_policy 必须含 max_trials/random_seed/timeout_seconds")
-    if type(policy["max_trials"]) is not int or not 1 <= policy["max_trials"] <= 20:
-        raise ValueError("max_trials 必须是 1–20 的整数")
+        raise ValueError("train_policy requires max_trials, random_seed, and timeout_seconds")
+    if type(policy["max_trials"]) is not int or policy["max_trials"] < 1:
+        raise ValueError("max_trials must be positive")
     if type(policy["random_seed"]) is not int or not 0 <= policy["random_seed"] <= 2**32 - 1:
-        raise ValueError("random_seed 超出范围")
+        raise ValueError("random_seed is outside its supported range")
     if type(policy["timeout_seconds"]) is not int or not 1 <= policy["timeout_seconds"] <= 600:
-        raise ValueError("timeout_seconds 必须是 1–600 的整数")
+        raise ValueError("timeout_seconds must be an integer between 1 and 600")
     normalized = dict(spec)
     normalized.update(task_id=task_id, data_version=data_version, modality=modality)
     return source_root.resolve(), normalized
@@ -210,10 +210,10 @@ def _load_split(
         )
     y = read_npy_array(label_path)
     if y.ndim != 1 or len(y) != split["n_samples"] or len(X) != split["n_samples"]:
-        raise ValueError(f"{split_name} 特征/标签行数与 n_samples 不一致")
+        raise ValueError(f"{split_name} features or labels do not match n_samples")
     after = {"features": _sha256(feature_path), "labels": _sha256(label_path)}
     if before != after:
-        raise ValueError(f"{split_name} 源文件在读取期间发生变化")
+        raise ValueError(f"{split_name} source files changed while being read")
     sample_rows, sample_hash = load_sample_index(source_root, split, split_name)
     return X, y, {
         "features": {
@@ -262,17 +262,17 @@ def _signature(spec: dict[str, Any], source_hashes: dict[str, Any]) -> str:
 def _cache(directory: Path, signature: str) -> dict[str, Any]:
     result_path = directory / "package_result.json"
     if not result_path.is_file():
-        raise ValueError("该 data_version 已存在但未完整发布；保留目录并使用新版本")
+        raise ValueError("This version exists without a complete package. Use a new version")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if result.get("status") != "success" or result.get("source_signature") != signature:
-        raise ValueError("该 data_version 的配置/源文件/预处理代码已变化；保留原目录并使用新版本")
+        raise ValueError("The configuration, inputs, or preprocessing changed. Use a new version")
     expected = result.get("artifact_sha256")
     if not isinstance(expected, dict) or set(expected) != set(_ARTIFACTS):
-        raise ValueError("模态缓存的产物清单不完整；保留原目录并使用新版本")
+        raise ValueError("The modality artifact manifest is incomplete. Use a new version")
     for relative, digest in expected.items():
         path = (directory / relative).resolve()
         if not path.is_relative_to(directory.resolve()) or not path.is_file() or _sha256(path) != digest:
-            raise ValueError("模态缓存产物缺失/变化/路径越界；保留原目录并使用新版本")
+            raise ValueError("A modality artifact is missing, changed, or outside the package. Use a new version")
     result.update(
         data_manifest_path=str((directory / "data_manifest.json").resolve()),
         evaluation_manifest_path=str((directory / "evaluation_manifest.json").resolve()),
@@ -309,11 +309,11 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
             for value in raw:
                 token = typed_category_token(value)
                 if not isinstance(token, str) or token not in label_to_id:
-                    raise ValueError(f"{name} 标签不在 label_values 声明中")
+                    raise ValueError(f"{name} labels contain a value absent from label_values")
                 output.append(label_to_id[token])
             labels = np.asarray(output, dtype=np.int64)
             if require_all and set(np.unique(labels).tolist()) != set(range(len(label_tokens))):
-                raise ValueError(f"{name} 标签未覆盖全部已声明类别")
+                raise ValueError(f"{name} labels do not cover all declared classes")
             return labels
 
         y_train = encode(y_train_raw, "train", True)

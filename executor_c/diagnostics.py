@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .contracts import publish_json, read_json, write_json
+from .contracts import publish_json, read_json
 
 SCHEMA_VERSION = "1.0"
 TIMING_FIELDS = ("input", "fit", "predict", "serialize", "reload_check", "total")

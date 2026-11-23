@@ -23,8 +23,16 @@ import math
 import re
 from typing import Any, Callable
 
+from executor_c.model_registry import (
+    PAIRWISE_MODEL_ID,
+    available_text_encoders,
+    default_pipeline,
+    normalize_params,
+    normalize_pipeline,
+    paired_text_pipeline,
+    validate_model_pipeline,
+)
 from executor_c.model_registry import capabilities as registry_capabilities
-from executor_c.model_registry import default_pipeline, normalize_params, normalize_pipeline
 
 from .planner import Planner, make_plan, recipe_key
 
@@ -33,15 +41,21 @@ _BASE_SYSTEM_PROMPT = (
     "Choose one next experiment from the supplied capability catalogue, or stop. "
     "Reply with exactly one JSON object: "
     '{"model":"<model_id>","params":{...},"pipeline":{...}} or '
-    '{"action":"stop","reason":"short reason"}. '
+    '{"action":"stop","reason":"short English reason"}. '
+    "Return only the compact JSON object, without analysis or a prose preface. "
     "Omitted parameters use the declared defaults. Never invent model IDs, "
     "parameters, values, code, paths, or execution settings. Do not repeat a "
     "configuration already present in history. Use only training/validation "
     "feedback; the test set must never influence a decision. For raw_text, "
     "the pipeline may choose shared versus separate field vocabularies and "
-    "word versus character TF-IDF. Satisfy pending_text_recipes during "
+    "word, character, or word_char (both) TF-IDF, hashing if listed, or a registered text_encoder with "
+    "optional lexical=char_tfidf to combine learned vectors with per-field TF-IDF. Use the "
+    "available encoder as a download-on-selection option with its listed supported_models. Try it early "
+    "after a classical baseline when available. Prefer pending_text_recipes during "
     "coverage before tuning parameters, then compare diverse models and "
-    "representations before refining a winner. Use validation_baseline to "
+    "representations before refining a winner. Prefer a materially different recipe "
+    "when the current family has repeatedly underperformed. Use planner_feedback to "
+    "correct a rejected proposal. Use validation_baseline to "
     "judge whether a score improves on a simple reference. Consider the "
     "data representation, metric direction, scores, failures, diagnostics, "
     "remaining trials, time, and budget. Stop when a hard limit is reached or "
@@ -124,6 +138,10 @@ def _compact_task_context(value: Any, *, max_bytes: int) -> dict[str, Any]:
     return result
 
 
+def _is_finite_scalar(value: Any) -> bool:
+    return type(value) in (int, bool) or (type(value) is float and math.isfinite(value))
+
+
 def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, Any]:
     if not isinstance(profile, dict):
         return {}
@@ -131,7 +149,7 @@ def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, An
     for key in (
         "n_train", "n_features_raw", "representation", "train_label_counts",
         "n_classes", "majority_share", "class_imbalance_ratio",
-        "image_shape", "max_characters", "channel_layout", "value_range",
+        "image_shape", "max_characters", "channel_layout", "value_range", "table_encoding",
     ):
         if key in profile:
             value = profile[key]
@@ -167,6 +185,11 @@ def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, An
         ]
         if len(feature_names) > limit:
             compact["feature_names_omitted"] = len(feature_names) - limit
+    for key in ("categorical_cardinalities", "missing_rates"):
+        stats = profile.get(key)
+        if isinstance(stats, dict):
+            top = sorted(stats.items(), key=lambda item: item[1], reverse=True)
+            compact[key] = dict(top[:4 if abbreviated else 10])
     feature_types = profile.get("feature_types")
     if isinstance(feature_types, dict):
         type_counts: dict[str, int] = {}
@@ -174,28 +197,32 @@ def _compact_profile(profile: Any, *, abbreviated: bool = False) -> dict[str, An
             name = str(value)
             type_counts[name] = type_counts.get(name, 0) + 1
         compact["feature_type_counts"] = type_counts
+
     quality = profile.get("quality_summary")
     if isinstance(quality, dict):
         compact["quality_summary"] = {
-            str(key)[:64]: value for key, value in list(quality.items())[:16]
-            if type(value) in (int, float, bool) and math.isfinite(value)
+            _short_text(key, 64): value for key, value in list(quality.items())[:16]
+            if _is_finite_scalar(value)
         }
+
     statistics = profile.get("column_statistics")
     if isinstance(statistics, list):
         selected = []
-        for field in statistics[:(4 if abbreviated else 8)]:
+        for field in statistics[:4 if abbreviated else 8]:
             if not isinstance(field, dict):
                 continue
             item = {"name": _short_text(field.get("name", ""), 64),
                     "kind": _short_text(field.get("kind", ""), 16)}
             for key in ("missing_fraction", "unique_count", "constant"):
                 value = field.get(key)
-                if type(value) in (int, float, bool) and math.isfinite(value):
+                if _is_finite_scalar(value):
                     item[key] = value
             lengths = field.get("length")
             if isinstance(lengths, dict):
-                item["length"] = {key: lengths[key] for key in ("mean", "p95", "max", "empty_count")
-                                  if type(lengths.get(key)) in (int, float) and math.isfinite(lengths[key])}
+                item["length"] = {
+                    key: lengths[key] for key in ("mean", "p95", "max", "empty_count")
+                    if _is_finite_scalar(lengths.get(key))
+                }
             selected.append(item)
         compact["column_statistics_sample"] = selected
         if len(statistics) > len(selected):
@@ -264,11 +291,14 @@ def _system_message(context: dict[str, Any]) -> str:
                         "supports_multiclass", "predict_proba", "fixed_settings",
                     ) if key in spec
                 }
-    components = capabilities.get("pipeline_components", {})
+    components = dict(capabilities.get("pipeline_components", {}))
+    components.pop("text_encoder", None)
+    if offered_encoders := available_text_encoders(context.get("capabilities") or {}):
+        components["text_encoder"] = offered_encoders
     if representations == {"raw_text"}:
         components = {
             key: components[key]
-            for key in ("feature_selector", "text_vectorizer")
+            for key in ("feature_selector", "text_vectorizer", "text_encoder")
             if key in components
         }
     elif representations == {"image_tensor"}:
@@ -286,11 +316,70 @@ def _system_message(context: dict[str, Any]) -> str:
         "models": safe_models,
         "pipeline_components": components,
     }
+    guidance = []
+    if PAIRWISE_MODEL_ID in safe_models:
+        guidance.append(
+            "For documented binary preferences, paired_logistic_regression compares both text fields "
+            "with the same vocabulary. Its default is separate word_char TF-IDF. An encoder "
+            "pipeline for this model must use separate fields and lexical=char_tfidf."
+        )
+    if "rbf_svc" in safe_models and representations == {"image_tensor"}:
+        guidance.append("For image rbf_svc, use a registered non-flattening image transform.")
     return (
         _BASE_SYSTEM_PROMPT
+        + (" " + " ".join(guidance) if guidance else "")
         + "\nThe only valid model and parameter catalogue for this run is:\n"
         + json.dumps(catalogue, ensure_ascii=False, sort_keys=True, allow_nan=False)
     )
+
+
+class PromptTooLarge(ValueError):
+    """The planner cannot fit its request within the gateway input limit."""
+
+
+def _compact_history(
+    history: list[dict[str, Any]], *, limit: int, greater: bool
+) -> list[dict[str, Any]]:
+    """Keep recent observations, the best result, and strong alternative recipes."""
+    if len(history) <= limit:
+        return history
+
+    def recipe_family(row: dict[str, Any]) -> tuple[Any, ...]:
+        pipeline = row.get("pipeline") or {}
+        for key in ("text_encoder", "text_vectorizer", "image_transform"):
+            component = pipeline.get(key)
+            if isinstance(component, dict):
+                params = component.get("params", {})
+                return (
+                    row["model"], component.get("name"), params.get("field_mode"),
+                    params.get("analyzer"), params.get("lexical"),
+                )
+        return (row["model"],)
+
+    recent_count = max(1, limit // 2)
+    selected = {row["trial"]: row for row in history[-recent_count:]}
+    ranked = sorted(
+        (
+            row for row in history if row["status"] == "success"
+            and type(row["metric_value"]) in (int, float)
+            and _is_finite_scalar(row["metric_value"])
+        ),
+        key=lambda row: row["metric_value"], reverse=greater,
+    )
+    leaders: set[tuple[Any, ...]] = set()
+    for row in ranked:
+        if len(selected) >= limit:
+            break
+        family = recipe_family(row)
+        if family in leaders:
+            continue
+        leaders.add(family)
+        selected[row["trial"]] = row
+    for row in reversed(history):
+        if len(selected) >= limit:
+            break
+        selected[row["trial"]] = row
+    return [selected[index] for index in sorted(selected)]
 
 
 class LLMPlanner:
@@ -307,6 +396,7 @@ class LLMPlanner:
         self._fallback = fallback
         self._log = log
         self._budget = budget
+        self._feedback: str | None = None
         if type(max_input_bytes) is not int or max_input_bytes <= 0:
             raise ValueError("max_input_bytes must be a positive integer")
         self._max_input_bytes = max_input_bytes
@@ -318,6 +408,7 @@ class LLMPlanner:
         include_diagnostics: bool,
         abbreviated: bool,
         task_context_max_bytes: int = _MAX_TASK_CONTEXT_BYTES,
+        history_limit: int | None = None,
     ) -> dict[str, Any]:
         history = []
         for index, item in enumerate(context.get("history", []), start=1):
@@ -390,6 +481,15 @@ class LLMPlanner:
             )
             if key in search
         }
+        history_count = len(history)
+        if history_limit is not None:
+            history = _compact_history(
+                history, limit=history_limit, greater=bool(context.get("greater_is_better", True)),
+            )
+            pending_recipes = search_summary.get("pending_text_recipes")
+            if isinstance(pending_recipes, list) and len(pending_recipes) > 8:
+                search_summary["pending_text_recipes"] = pending_recipes[:8]
+                search_summary["pending_text_recipe_count"] = len(pending_recipes)
         payload = {
             "data_overview": data_overview,
             # Parameter details are already present once, in the system catalogue.
@@ -402,6 +502,10 @@ class LLMPlanner:
             "patience": context.get("patience"),
             "remaining_trials": context.get("remaining_trials"),
         }
+        if history_count > len(history):
+            payload["omitted_history_trials"] = history_count - len(history)
+        if self._feedback:
+            payload["planner_feedback"] = self._feedback
         metric = context.get("primary_metric")
         if isinstance(metric, dict) and isinstance(metric.get("name"), str):
             payload["primary_metric"] = {
@@ -433,17 +537,21 @@ class LLMPlanner:
             - _CHAT_TEMPLATE_OVERHEAD_BYTES
             - _INPUT_SAFETY_MARGIN_BYTES
         )
-        for include_diagnostics, abbreviated, task_context_max_bytes in (
-            (True, False, _MAX_TASK_CONTEXT_BYTES),
-            (False, False, _MAX_TASK_CONTEXT_BYTES),
-            (False, True, 512),
-            (False, True, 0),
+        for include_diagnostics, abbreviated, task_context_max_bytes, history_limit in (
+            (True, False, _MAX_TASK_CONTEXT_BYTES, None),
+            (False, False, _MAX_TASK_CONTEXT_BYTES, None),
+            (False, True, 512, None),
+            (False, True, 0, None),
+            (False, True, 512, 16),
+            (False, True, 256, 8),
+            (False, True, 0, 4),
         ):
             payload = self._user_payload(
                 context,
                 include_diagnostics=include_diagnostics,
                 abbreviated=abbreviated,
                 task_context_max_bytes=task_context_max_bytes,
+                history_limit=history_limit,
             )
             message = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":"), default=str
@@ -462,9 +570,7 @@ class LLMPlanner:
             )
             if serialized_size <= safe_limit:
                 return message
-        raise ValueError(
-            "压缩后的规划上下文仍超过学校 API 输入字节上限；未发送请求"
-        )
+        raise PromptTooLarge("Planning context exceeds the input limit after compaction.")
 
     def _parse_reply(self, reply: Any) -> dict[str, Any]:
         if isinstance(reply, dict):
@@ -496,52 +602,71 @@ class LLMPlanner:
                 detail="LLM planner reply carried no usage info; gateway must return usage for accounting"
             )
 
+    def note_empty_reply(self) -> None:
+        self._feedback = "The previous reply had no usable text. Return a compact JSON plan."
+
+    def note_early_stop(self) -> None:
+        self._feedback = (
+            "Exploration has not met its minimum yet. Propose one feasible untried recipe."
+        )
+
     def _fallback_plan(self, context: dict[str, Any], message: str) -> dict[str, Any] | None:
+        self._feedback = message
         if self._log is not None:
             self._log.event("llm_planner_fallback", reason=message)
         return self._fallback.next_plan(context)
 
     def next_plan(self, context: dict[str, Any]) -> dict[str, Any] | None:
         system_message = _system_message(context)
+        try:
+            user_message = self._user_message(context, system_message=system_message)
+        except PromptTooLarge:
+            return self._fallback_plan(context, "Planning context exceeded the gateway input limit.")
         messages = [
             {"role": "system", "content": system_message},
-            {
-                "role": "user",
-                "content": self._user_message(context, system_message=system_message),
-            },
+            {"role": "user", "content": user_message},
         ]
-        try:
-            reply = self._call_llm(messages)
-        except Exception:
-            # Transport, timeout, and unknown-usage failures must reach the outer
-            # session handler; silently falling back would hide a paid-call failure.
-            raise
+        # Let gateway failures reach the session handler along with their ledger state.
+        reply = self._call_llm(messages)
         self._record_usage(reply)
         text = reply.get("text") if isinstance(reply, dict) else reply
 
         try:
             parsed = self._parse_reply(text)
-        except Exception:
-            return self._fallback_plan(context, "unparseable LLM decision; using registered fallback")
+        except (TypeError, ValueError):
+            return self._fallback_plan(context, "Return one JSON object without explanatory text.")
 
         if parsed.get("action") == "stop":
             if set(parsed) - {"action", "reason"}:
                 return self._fallback_plan(context, "LLM stop decision contains unsupported fields")
-            reason = str(parsed.get("reason", "LLM planner decided to stop"))
-            return {"stop": reason}
+            reason = parsed.get("reason", "School planner recommended stopping.")
+            if not isinstance(reason, str):
+                return self._fallback_plan(context, "The stop reason must be a short string.")
+            self._feedback = None
+            if self._log is not None:
+                self._log.event("llm_planner_stop")
+            normalized_reason = " ".join(reason.split())
+            return {
+                "stop": normalized_reason[:240] if normalized_reason and normalized_reason.isascii()
+                else "School planner recommended stopping."
+            }
 
-        if set(parsed) not in ({"model", "params"}, {"model", "params", "pipeline"}):
+        if (
+            parsed.get("action", "run") != "run"
+            or set(parsed) - {"action", "model", "params", "pipeline", "reason"}
+            or ("reason" in parsed and not isinstance(parsed["reason"], str))
+        ):
             return self._fallback_plan(context, "LLM run decision contains unsupported fields")
 
         model = parsed.get("model")
         params = parsed.get("params")
-        if model is None or params is None:
+        if not isinstance(model, str) or not isinstance(params, dict):
             return self._fallback_plan(context, "LLM decision lacks model/params; using registered fallback")
 
         try:
             validated = validate_model_params(model, params)
-        except ValueError as exc:
-            return self._fallback_plan(context, f"LLM decision failed registry validation: {exc}")
+        except (TypeError, ValueError):
+            return self._fallback_plan(context, "Use a listed model and its declared parameter ranges.")
         representations = set(
             (context.get("data_overview") or {}).get("representations", ["dense_numeric"])
         )
@@ -555,34 +680,40 @@ class LLMPlanner:
         search = context.get("search", {})
         if representation == "dense_numeric" and "pipeline" in parsed:
             return self._fallback_plan(context, "dense numeric plans cannot declare a pipeline")
-        try:
-            pipeline = (
-                normalize_pipeline(
-                    representation,
-                    parsed.get("pipeline", default_pipeline(representation)),
+        pipeline = None
+        if representation in {"raw_text", "image_tensor"}:
+            default = paired_text_pipeline() if model == PAIRWISE_MODEL_ID else default_pipeline(representation)
+            if model == "rbf_svc" and representation == "image_tensor":
+                transforms = (context.get("capabilities") or {}).get("pipeline_components", {}).get(
+                    "image_transform", {},
                 )
-                if representation in {"raw_text", "image_tensor"}
-                else None
+                transform = "spatial_pyramid" if "spatial_pyramid" in transforms else "gradient_cells"
+                default["image_transform"] = {"name": transform, "params": {}}
+            try:
+                pipeline = normalize_pipeline(representation, parsed.get("pipeline", default))
+                validate_model_pipeline(model, pipeline)
+            except (TypeError, ValueError):
+                return self._fallback_plan(context, "Use a listed pipeline compatible with the selected model.")
+        if pipeline:
+            for key in ("text_vectorizer", "image_transform"):
+                if key not in pipeline:
+                    continue
+                offered_components = (context.get("capabilities") or {}).get("pipeline_components", {})
+                if key in offered_components and pipeline[key]["name"] not in offered_components[key]:
+                    return self._fallback_plan(context, f"{key} component is unavailable")
+        uses_encoder = pipeline is not None and "text_encoder" in pipeline
+        if uses_encoder:
+            offered = available_text_encoders(context.get("capabilities") or {})
+            if pipeline["text_encoder"]["name"] not in offered:
+                return self._fallback_plan(context, "Local text encoder is not available")
+        if (
+            representation != "raw_text"
+            and search.get("phase") == "coverage"
+            and model not in search.get("pending_model_ids", [])
+        ):
+            return self._fallback_plan(
+                context, "LLM decision does not satisfy pending model/representation coverage"
             )
-        except ValueError as exc:
-            return self._fallback_plan(context, f"LLM pipeline failed registry validation: {exc}")
-        pending_text = search.get("pending_text_recipes", [])
-        if search.get("phase") == "coverage":
-            if pending_text and representation == "raw_text" and pipeline is not None:
-                text_params = pipeline["text_vectorizer"]["params"]
-                strategy_keys = ("field_mode", "analyzer", "ngram_min", "ngram_max")
-                is_pending = any(
-                    isinstance(item, dict)
-                    and item.get("model") == model
-                    and all(item.get(key) == text_params[key] for key in strategy_keys)
-                    for item in pending_text
-                )
-            else:
-                is_pending = model in search.get("pending_model_ids", [])
-            if not is_pending:
-                return self._fallback_plan(
-                    context, "LLM decision does not satisfy pending model/representation coverage"
-                )
 
         tried = {
             recipe_key(
@@ -593,9 +724,10 @@ class LLMPlanner:
         }
         if recipe_key(model, validated, pipeline, representation) in tried:
             return self._fallback_plan(
-                context, f"LLM proposed already-tried config {model} {validated}"
+                context, "The previous recipe was already tried. Change the model, pipeline, or model parameters."
             )
 
+        self._feedback = None
         plan = make_plan(
             context["task_id"],
             context["data_version"],

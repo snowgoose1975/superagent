@@ -24,7 +24,7 @@ class TaskBudgetError(RuntimeError):
     """Budget ledger could not safely reserve or settle a task expense."""
 
 
-COURSE_PRICE_PROFILE_2026_10_21: dict[str, Any] = {
+COURSE_PRICE_PROFILE_PEAK_2026_10_21: dict[str, Any] = {
     "profile_id": "deepseek-v4.1-flash-peak-2026-10-21",
     "provider": "DeepSeek (published reference price)",
     "model_identity_verified_for_school_endpoint": False,
@@ -49,8 +49,40 @@ COURSE_PRICE_PROFILE_2026_10_21: dict[str, Any] = {
     ),
 }
 
+COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21: dict[str, Any] = {
+    "profile_id": "deepseek-v4.1-flash-offpeak-2026-10-21",
+    "provider": "DeepSeek (published reference price)",
+    "model_identity_verified_for_school_endpoint": False,
+    "effective_date": "2026-10-21",
+    "input_cny_per_million": "1.007880",
+    "output_cny_per_million": "4.031520",
+    "source_basis": {
+        "usd_input_per_million": "0.15",
+        "usd_output_per_million": "0.60",
+        "price_tier": "published off-peak, cache-miss standard rates",
+        "fx_cny_per_usd": "6.7192",
+        "fx_date": "2026-10-21",
+    },
+    "sources": [
+        "https://api-docs.deepseek.com/quick_start/pricing/",
+        "https://api-docs.deepseek.com/updates/",
+        "https://www.shibor.sh.cn/chinese/ccprnoticecontent/index.html?searchDate=2026-10-21",
+    ],
+    "billing_caveat": (
+        "Conversion of DeepSeek's published off-peak/cache-miss rates; "
+        "not confirmation of the school endpoint's provider, model alias, or actual billing."
+    ),
+}
+
+# Backward-compatible public name for callers that imported the original peak profile.
+COURSE_PRICE_PROFILE_2026_10_21 = COURSE_PRICE_PROFILE_PEAK_2026_10_21
+
 _PROFILE_BY_ID = {
-    COURSE_PRICE_PROFILE_2026_10_21["profile_id"]: COURSE_PRICE_PROFILE_2026_10_21
+    profile["profile_id"]: profile
+    for profile in (
+        COURSE_PRICE_PROFILE_PEAK_2026_10_21,
+        COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21,
+    )
 }
 _BUDGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESERVATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -60,6 +92,10 @@ _MILLION = Decimal(1_000_000)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+class TaskBalanceExhausted(TaskBudgetError):
+    """The valid ledger cannot reserve another request."""
 
 
 def _decimal(value: Any, field: str, *, positive: bool = False) -> Decimal:
@@ -251,9 +287,17 @@ class TaskBudgetLedger:
             data.get("schema_version") != _LEDGER_SCHEMA_VERSION
             or data.get("budget_id") != self.budget_id
             or data.get("budget_rmb") != _canonical_decimal(self._limit)
-            or data.get("price_profile") != self._profile
             or not isinstance(data.get("reservations"), dict)
         ):
+            raise TaskBudgetError(
+                "task budget ledger settings differ from this request; refusing to reset or reprice"
+            )
+        previous_profile = data.get("price_profile")
+        can_transition_peak_to_offpeak = (
+            previous_profile == COURSE_PRICE_PROFILE_PEAK_2026_10_21
+            and self._profile == COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21
+        )
+        if previous_profile != self._profile and not can_transition_peak_to_offpeak:
             raise TaskBudgetError(
                 "task budget ledger settings differ from this request; refusing to reset or reprice"
             )
@@ -265,6 +309,28 @@ class TaskBudgetLedger:
             _decimal(item.get("reserved_rmb"), "reserved_rmb")
             if item["status"] == "settled":
                 _decimal(item.get("actual_cost_rmb"), "actual_cost_rmb")
+        migrations = data.get("profile_migrations", [])
+        if not isinstance(migrations, list) or not all(isinstance(item, dict) for item in migrations):
+            raise TaskBudgetError("task budget profile migration history is malformed")
+        if can_transition_peak_to_offpeak:
+            for reservation in data["reservations"].values():
+                reservation.setdefault(
+                    "pricing_profile_id", previous_profile["profile_id"]
+                )
+            migrations.append(
+                {
+                    "migrated_at": _now(),
+                    "from_profile": previous_profile,
+                    "to_profile": self._profile,
+                    "policy": (
+                        "Preserve all historical settled costs and pending/unknown reservations; "
+                        "use the new profile only for future reservations."
+                    ),
+                }
+            )
+            data["profile_migrations"] = migrations
+            data["price_profile"] = self._profile
+            self._write(data)
 
     def _write(self, data: dict[str, Any]) -> None:
         data["updated_at"] = _now()
@@ -332,11 +398,12 @@ class TaskBudgetLedger:
                 raise TaskBudgetError("reservation ID already exists and cannot be reused")
             _settled, _reserved, remaining = self._totals(data)
             if amount > remaining:
-                raise TaskBudgetError("task budget cannot cover the worst-case request reservation")
+                raise TaskBalanceExhausted("task budget cannot cover the worst-case request reservation")
             data["reservations"][reservation_id] = {
                 "session_id": session_id,
                 "status": "pending",
                 "created_at": _now(),
+                "pricing_profile_id": self._profile["profile_id"],
                 "max_input_tokens": input_bound,
                 "max_output_tokens": output_bound,
                 "reserved_rmb": format(amount, "f"),
@@ -345,7 +412,11 @@ class TaskBudgetLedger:
                 "actual_cost_rmb": None,
             }
             self._write(data)
-        return {"reservation_id": reservation_id, "reserved_rmb": format(amount, "f")}
+        return {
+            "reservation_id": reservation_id,
+            "reserved_rmb": format(amount, "f"),
+            "pricing_profile_id": self._profile["profile_id"],
+        }
 
     def settle(self, reservation_id: str, *, input_tokens: int, output_tokens: int) -> dict[str, str]:
         """Replace a pending worst-case reservation with known actual usage."""
@@ -418,5 +489,6 @@ class TaskBudgetLedger:
                 "unknown_count": sum(item["status"] == "unknown" for item in reservations.values()),
                 "settled_count": sum(item["status"] == "settled" for item in reservations.values()),
                 "price_profile": data["price_profile"],
+                "profile_migrations": data.get("profile_migrations", []),
             }
 

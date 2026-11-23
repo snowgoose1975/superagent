@@ -1,4 +1,4 @@
-"""把声明式 NPY train/validation 分区冻结为 C v1 数据包。"""
+"""Freeze declared NPY train and validation partitions for C."""
 
 from __future__ import annotations
 
@@ -73,22 +73,22 @@ def _safe_id(value: Any, field: str) -> str:
         or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value)
         or ".." in value
     ):
-        raise ValueError(f"{field} 必须是 1-64 位安全 ASCII 字符")
+        raise ValueError(f"{field} must contain 1 to 64 safe ASCII characters")
     return value
 
 
 def _source_file(root: Path, value: Any) -> tuple[Path, str]:
     if not isinstance(value, str) or not value or Path(value).is_absolute():
-        raise ValueError("分区文件路径必须是 source_root 内的相对路径")
+        raise ValueError("Partition files require a relative path within source_root")
     if ".." in Path(value).parts:
-        raise ValueError("分区文件路径不能包含 ..")
+        raise ValueError("Partition file paths cannot contain ..")
     path = (root / value).resolve()
     try:
         relative = path.relative_to(root)
     except ValueError as exc:
-        raise ValueError("分区文件路径越出 source_root") from exc
+        raise ValueError("Partition file path escapes source_root") from exc
     if not path.is_file():
-        raise ValueError(f"分区文件不存在：{relative.as_posix()}")
+        raise ValueError(f"Partition file does not exist: {relative.as_posix()}")
     return path, relative.as_posix()
 
 
@@ -100,12 +100,12 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
             if isinstance(task_spec, dict)
             else sorted(_TASK_FIELDS)
         )
-        raise ValueError(f"任务配置字段不匹配；缺少 {missing}，额外 {extra}")
+        raise ValueError(f"Task config fields differ. Missing: {missing}. Unexpected: {extra}")
     if task_spec["schema_version"] != "1.0" or task_spec["source_format"] != "npy_array_package":
-        raise ValueError("仅支持 schema 1.0 与 npy_array_package")
+        raise ValueError("Expected schema 1.0 and npy_array_package")
     root = Path(task_spec["source_root"]).expanduser()
     if not root.is_absolute() or not root.is_dir():
-        raise ValueError("source_root 必须是现存目录的绝对路径")
+        raise ValueError("source_root must be an existing absolute directory")
     root = root.resolve()
     columns = task_spec["feature_columns"]
     if (
@@ -113,14 +113,14 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
         or not columns
         or any(not isinstance(c, str) or not c.strip() for c in columns)
     ):
-        raise ValueError("feature_columns 必须是非空列名列表")
+        raise ValueError("feature_columns must be a non-empty list of column names")
     if len(columns) != len(set(columns)):
-        raise ValueError("feature_columns 不能重复")
+        raise ValueError("feature_columns cannot contain duplicates")
     kinds = task_spec["feature_types"]
     if not isinstance(kinds, dict) or set(kinds) != set(columns):
-        raise ValueError("feature_types 必须且只能覆盖 feature_columns")
+        raise ValueError("feature_types must cover exactly feature_columns")
     if any(kind not in {"categorical", "numeric", "text"} for kind in kinds.values()):
-        raise ValueError("feature_types 仅支持 categorical、numeric 或 text")
+        raise ValueError("feature_types values must be categorical, numeric, or text")
     validate_preprocessing(task_spec.get("preprocessing"), kinds)
     validate_metric_spec(task_spec["primary_metric"])
     policy = task_spec["train_policy"]
@@ -129,21 +129,21 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
         "random_seed",
         "timeout_seconds",
     }:
-        raise ValueError("train_policy 必须含 max_trials/random_seed/timeout_seconds")
+        raise ValueError("train_policy requires max_trials, random_seed, and timeout_seconds")
     if type(policy["max_trials"]) is not int or policy["max_trials"] < 1:
-        raise ValueError("max_trials 必须为正整数")
+        raise ValueError("max_trials must be positive")
     if type(policy["random_seed"]) is not int or not 0 <= policy["random_seed"] <= 2**32 - 1:
-        raise ValueError("random_seed 超出范围")
+        raise ValueError("random_seed is outside its supported range")
     if type(policy["timeout_seconds"]) is not int or policy["timeout_seconds"] < 1:
-        raise ValueError("timeout_seconds 必须为正整数")
+        raise ValueError("timeout_seconds must be positive")
     partitions = task_spec["partitions"]
     if not isinstance(partitions, dict) or set(partitions) != _PARTITIONS:
-        raise ValueError("partitions 必须且只能包含 train 与 validation；禁止 test 字段")
+        raise ValueError("partitions must contain only train and validation")
     for name, part in partitions.items():
         if not isinstance(part, dict) or not _SPLIT_FIELDS <= set(part) <= _SPLIT_FIELDS | {"sample_ids_path"}:
-            raise ValueError(f"{name} 分区需要 features_path/labels_path/n_samples，可选 sample_ids_path")
+            raise ValueError(f"{name} requires features_path, labels_path, and n_samples. sample_ids_path is optional")
         if type(part["n_samples"]) is not int or part["n_samples"] < 1:
-            raise ValueError(f"{name}.n_samples 必须为正整数")
+            raise ValueError(f"{name}.n_samples must be positive")
     values, names = task_spec["label_values"], task_spec["label_names"]
     if (
         not isinstance(values, list)
@@ -151,14 +151,14 @@ def _validate_spec(task_spec: dict[str, Any]) -> tuple[Path, list[str], dict[str
         or not isinstance(names, list)
         or len(names) != len(values)
     ):
-        raise ValueError("label_values/label_names 必须等长且至少有两个类别")
+        raise ValueError("label_values and label_names must have equal lengths and at least two classes")
     tokens = [typed_category_token(value) for value in values]
     if any(not isinstance(token, str) for token in tokens) or len(tokens) != len(set(tokens)):
-        raise ValueError("label_values 必须是唯一、非缺失的静态标量")
+        raise ValueError("label_values must be unique, non-missing scalars")
     if any(not isinstance(name, str) or not name.strip() for name in names) or len(names) != len(
         set(names)
     ):
-        raise ValueError("label_names 必须是唯一的非空字符串")
+        raise ValueError("label_names must be unique non-empty strings")
     _safe_id(task_spec["task_id"], "task_id")
     _safe_id(task_spec["data_version"], "data_version")
     return root, list(columns), dict(kinds)
@@ -174,10 +174,10 @@ def _load_partition(
     frame = load_feature_frame(feature_path, columns, kinds)
     labels = read_npy_array(label_path)
     if labels.ndim != 1 or len(labels) != part["n_samples"] or len(frame) != part["n_samples"]:
-        raise ValueError(f"{name} 特征/标签维度与 n_samples 不一致")
+        raise ValueError(f"{name} features or labels do not match n_samples")
     feature_hash_after, label_hash_after = _sha256(feature_path), _sha256(label_path)
     if (feature_hash_before, label_hash_before) != (feature_hash_after, label_hash_after):
-        raise ValueError(f"{name} 源文件在读取期间发生变化")
+        raise ValueError(f"{name} source files changed while being read")
     hashes = {
         "features": {"relative_path": feature_relative, "sha256": feature_hash_after},
         "labels": {"relative_path": label_relative, "sha256": label_hash_after},
@@ -191,7 +191,7 @@ def _load_partition(
 def _label_token(value: Any) -> str:
     token = typed_category_token(value)
     if not isinstance(token, str):
-        raise ValueError("标签中存在 None/NaN")
+        raise ValueError("Labels cannot contain None or NaN")
     return token
 
 
@@ -221,30 +221,33 @@ def _source_signature(
     return semantic
 
 
+_NATIVE_SPLITS = ("native_train.json", "native_validation.json")
+
+
 def _read_cache(directory: Path, signature: str) -> dict[str, Any] | None:
     result_path = directory / "package_result.json"
     if not result_path.is_file():
-        raise ValueError("该数据版本目录已存在但没有完整成功记录；保留原目录并使用新版本")
+        raise ValueError("Existing version has no complete successful package. Use a new version")
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(
-            "该数据版本的 package_result.json 无法读取；保留原目录并使用新版本"
+            "Cannot read package_result.json. Use a new version"
         ) from exc
     if result.get("status") != "success" or result.get("source_signature") != signature:
-        raise ValueError("该数据版本不完整或源配置/数据已变化；保留原目录并使用新版本")
+        raise ValueError("This version is incomplete or its inputs changed. Use a new version")
     expected = result.get("artifact_sha256")
-    if not isinstance(expected, dict) or set(expected) != set(_ARTIFACTS):
-        raise ValueError("该数据版本的产物清单不完整；保留原目录并使用新版本")
+    if not isinstance(expected, dict) or set(expected) not in (set(_ARTIFACTS), set(_ARTIFACTS + _NATIVE_SPLITS)):
+        raise ValueError("The cached artifact manifest is incomplete. Use a new version")
     for relative, digest in expected.items():
         path = (directory / relative).resolve()
         try:
             path.relative_to(directory.resolve())
         except ValueError as exc:
-            raise ValueError("缓存产物路径越界") from exc
+            raise ValueError("Cached artifact path escapes the package") from exc
         if not path.is_file() or _sha256(path) != digest:
-            raise ValueError(f"该数据版本产物缺失或已变化：{relative}；保留原目录并使用新版本")
-    # 搬迁后只修正本次返回值；冻结的 package_result.json 保持原始字节不变。
+            raise ValueError(f"Cached artifact is missing or changed: {relative}. Use a new version")
+    # Resolve returned paths after moving the package while keeping its manifest immutable.
     result.update(
         {
             "data_manifest_path": str((directory / "data_manifest.json").resolve()),
@@ -273,7 +276,7 @@ def _save_ids(path: Path, ids: list[str], values: list[int] | None = None) -> No
 
 
 def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, Any]:
-    """准备或复用一个不可变 B 数据版本，并返回供 C/D 使用的绝对路径。"""
+    """Prepare or reuse an immutable package and return absolute paths for C and D."""
     if isinstance(task_spec, dict) and task_spec.get("schema_version") == "2.0":
         from .prepare_modalities import prepare_modalities
 
@@ -293,7 +296,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
             source_root, "validation", task_spec, columns, kinds
         )
         if train_frame.shape[1] != valid_frame.shape[1]:
-            raise ValueError("训练与验证特征列不一致")
+            raise ValueError("Train and validation feature columns differ")
         label_tokens = [_label_token(value) for value in task_spec["label_values"]]
         label_to_id = {token: index for index, token in enumerate(label_tokens)}
 
@@ -302,13 +305,13 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
             for value in raw:
                 token = _label_token(value)
                 if token not in label_to_id:
-                    raise ValueError(f"{split} 标签不在 label_values 声明中")
+                    raise ValueError(f"{split} labels contain a value absent from label_values")
                 encoded.append(label_to_id[token])
             result = np.asarray(encoded, dtype=np.int64)
             if require_all_classes and set(np.unique(result).tolist()) != set(
                 range(len(label_tokens))
             ):
-                raise ValueError(f"{split} 标签未覆盖全部已声明类别")
+                raise ValueError(f"{split} labels do not cover all declared classes")
             return result
 
         y_train = encode(train_raw_labels, "train", require_all_classes=True)
@@ -321,11 +324,13 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
         metadata = directory / "metadata"
         metadata.mkdir()
         try:
-            preprocessor = TablePreprocessor(kinds, options=task_spec.get("preprocessing"))
+            preprocessor = TablePreprocessor(
+                kinds, options=task_spec.get("preprocessing"), allow_frequency_fallback=True,
+            )
             X_train = preprocessor.fit_transform(train_frame)
             X_valid = preprocessor.transform(valid_frame)
             if X_train.shape[1] < 1:
-                raise ValueError("预处理后没有可用特征")
+                raise ValueError("Preprocessing yielded no usable features")
             train_counts = {
                 name: int(np.sum(y_train == index))
                 for index, name in enumerate(task_spec["label_names"])
@@ -342,8 +347,14 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
                 "train_label_counts": train_counts,
                 "preprocessing": task_spec.get("preprocessing", {}),
                 **table_profile(train_frame, kinds),
+                "table_encoding": "frequency" if preprocessor.frequency_maps_ else "one_hot",
             }
             _write_json(metadata / "profile.json", profile)
+            for name, frame in zip(_NATIVE_SPLITS, (train_frame, valid_frame), strict=True):
+                rows = frame.astype(object).where(frame.notna(), None).values.tolist()
+                payload = json.dumps({"columns": columns, "data": rows}, allow_nan=False)
+                with (directory / name).open("x", encoding="utf-8") as stream:
+                    stream.write(payload)
             save_combined_index(metadata / "sample_index.csv", train_index, valid_index)
             _save_array(directory / "X_train.npy", X_train)
             _save_array(directory / "y_train.npy", y_train)
@@ -399,7 +410,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
             manifest_bytes = _json_bytes(manifest)
             file_hashes = {
                 name: _sha256(directory / name)
-                for name in _ARTIFACTS
+                for name in _ARTIFACTS + _NATIVE_SPLITS
                 if name != "data_manifest.json"
             }
             file_hashes["data_manifest.json"] = hashlib.sha256(manifest_bytes).hexdigest()
