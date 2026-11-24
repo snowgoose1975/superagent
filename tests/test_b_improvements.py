@@ -108,7 +108,7 @@ class BImprovementsTests(unittest.TestCase):
 
     def test_duplicate_original_ids_are_rejected(self):
         write_csv(self.source / "train.csv", ["id", "x", "label"], [["0001", i, i % 2] for i in range(8)])
-        with self.assertRaisesRegex(TaskDirectoryError, "ID 重复"):
+        with self.assertRaisesRegex(TaskDirectoryError, "Duplicate source sample IDs"):
             self.discover()
 
     def test_multi_column_ids_are_reversible_and_unique(self):

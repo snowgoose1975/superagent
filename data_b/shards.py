@@ -92,8 +92,8 @@ def build_contract(contract):
             if set(item) != {"features", "labels"} or not isinstance(features, list) or len(features) != expected:
                 raise InputReaderError("Shard feature counts must match the training reader")
             if fmt in {"npy", "text_lines"}:
-                if not isinstance(labels, str):
-                    raise InputReaderError("Every NPY/text shard requires its own labels path")
+                if not isinstance(labels, str) and not (role == "test" and labels is None):
+                    raise InputReaderError("Every development NPY/text shard requires its own labels path")
             elif labels is not None:
                 raise InputReaderError("Record shard labels must come from the target column")
             for name in [*features, *([labels] if labels is not None else [])]:
@@ -131,6 +131,7 @@ def _records(root, shards, reader, split, touch, *, fit, prediction):
 
     fmt, records, origins, total_bytes, characters = reader["base_format"], [], [], 0, 0
     expected = None if fit else set(reader["source_columns"])
+    infer_test_labels = prediction is None
     for shard in shards:
         source = shard["feature_paths"][0]
         path = ir.source_path(root, source)
@@ -142,7 +143,9 @@ def _records(root, shards, reader, split, touch, *, fit, prediction):
             header, rows = td._read_csv(path)
             rows = [dict(zip(header, row, strict=True)) for row in rows]
         else:
-            rows = ir._record_rows(path, fmt, reader["base_options"], skip_field=reader["target_column"] if prediction else None)
+            rows = ir._record_rows(path, fmt, reader["base_options"],
+                                   skip_field=reader["target_column"] if prediction and not infer_test_labels else None,
+                                   optional_field=reader["target_column"] if infer_test_labels else None)
             header = list(rows[0])
         if fit and expected is None:
             expected = set(header)
@@ -151,6 +154,11 @@ def _records(root, shards, reader, split, touch, *, fit, prediction):
                 reader["target_column"] = td._target_column({}, "", header)
             if not reader["id_columns"]:
                 reader["id_columns"] = td._id_columns({}, "", header, reader["target_column"])
+        if infer_test_labels:
+            blind = ir._prediction_only(rows, reader["target_column"])
+            if prediction is not None and prediction != blind:
+                raise ir.InputReaderError("All test shards must agree on label availability")
+            prediction = blind
         actual = set(header)
         allowed = expected - {reader["target_column"]} if prediction else expected
         if not allowed <= actual <= expected or (not prediction and actual != expected):
@@ -183,6 +191,11 @@ def _arrays(root, shards, reader, split, touch, *, fit, prediction):
     limits = ReaderLimits()
     rows = elements = payload = characters = source_bytes = 0
     fmt = reader["base_format"]
+    if prediction is None:
+        label_availability = {shard.get("labels_path") is not None for shard in shards}
+        if len(label_availability) != 1:
+            raise ir.InputReaderError("All test shards must agree on label availability")
+        prediction = False in label_availability
     for shard in shards:
         paths = shard["feature_paths"]
         for name in [*paths, *([shard["labels_path"]] if shard.get("labels_path") else [])]:
@@ -198,9 +211,9 @@ def _arrays(root, shards, reader, split, touch, *, fit, prediction):
             if characters > ir.MAX_CHARACTERS:
                 raise ir.InputReaderError("Combined text shards exceed the corpus character budget")
             X = np.asarray(texts, dtype=object).reshape(-1, 1)
-            y = np.asarray(["__prediction__"] * len(X) if prediction else
-                           ir._text(ir.source_path(root, shard["labels_path"])).splitlines(), dtype=object)
-            if not prediction and any(not str(label).strip() for label in y):
+            y = None if prediction else np.asarray(
+                ir._text(ir.source_path(root, shard["labels_path"])).splitlines(), dtype=object)
+            if y is not None and any(not str(label).strip() for label in y):
                 raise ir.InputReaderError("Text shard labels cannot be empty")
         else:
             X, current_widths = td._read_npy_matrix(root, paths)
@@ -208,11 +221,11 @@ def _arrays(root, shards, reader, split, touch, *, fit, prediction):
                 reader["family_widths"] = current_widths
             if current_widths != reader.get("family_widths"):
                 raise ir.InputReaderError("NPY shard feature-family widths differ from training")
-            y = np.asarray(["__prediction__"] * len(X), dtype=object) if prediction else normalize_classification_labels(
+            y = None if prediction else normalize_classification_labels(
                 read_npy_array(ir.source_path(root, shard["labels_path"])))
             if X.ndim == 1:
                 X = X.reshape(-1, 1)
-        if not len(X) or len(X) != len(y):
+        if not len(X) or (y is not None and len(X) != len(y)):
             raise ir.InputReaderError("Each shard's feature and label row counts must match and be nonempty")
         expected_shape = reader.get("source_shape")
         if fit and not chunks:
@@ -221,18 +234,19 @@ def _arrays(root, shards, reader, split, touch, *, fit, prediction):
             raise ir.InputReaderError("Shard shape/dtype differs from the training schema")
         rows += len(X)
         elements += X.size
-        payload += X.nbytes + y.nbytes
+        payload += X.nbytes + (y.nbytes if y is not None else 0)
         object_data = X.dtype.hasobject or fmt == "text_lines"
         if (rows > (ir.MAX_ROWS if fmt == "text_lines" else limits.max_rows)
                 or elements > (ir.MAX_ELEMENTS if object_data else limits.max_elements)
                 or max(payload, source_bytes) > (limits.max_object_payload_bytes if object_data else limits.max_payload_bytes)):
             raise ir.InputReaderError("Combined array shards exceed the row/element/byte budget")
         chunks.append(X)
-        targets.append(y)
+        if y is not None:
+            targets.append(y)
         source = paths[0] if len(paths) == 1 else json.dumps(paths, separators=(",", ":"))
         origins.extend((source, i) for i in range(len(X)))
     X = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-    y = np.concatenate([part.astype(object) for part in targets])
+    y = None if prediction else np.concatenate([part.astype(object, copy=False) for part in targets])
     index = [{"sample_id": f"{split}_{i:09d}", "source_file": name, "source_row": str(local), "original_id": ""}
              for i, (name, local) in enumerate(origins)]
     if fit:
@@ -244,7 +258,7 @@ def _arrays(root, shards, reader, split, touch, *, fit, prediction):
             info = {"feature_types": reader["declared_types"]} if reader["declared_types"] else {}
             td._configure_npy_columns(X, reader["family_widths"], reader, reader["feature_columns"] or None, info)
     X, y, index = td._filter_array_samples(X, y, index, reader, split)
-    return td._npy_features(X, reader), td._labels(y), index
+    return td._npy_features(X, reader), None if y is None else td._labels(y), index
 
 
 def read_shards(root, files, reader, split, touch, *, fit=False, prediction=False):

@@ -1,4 +1,4 @@
-"""端到端验证合成任务、可替换 A/D 和冻结模型推理。"""
+"""End-to-end checks for synthetic tasks, replaceable modules, and frozen inference."""
 
 from __future__ import annotations
 
@@ -26,6 +26,11 @@ def _history(root: Path, summary: dict[str, Any]) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def _events(root: Path, summary: dict[str, Any]) -> list[dict[str, Any]]:
+    path = root / summary["events_path"]
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def _assert_score(score: dict[str, Any]) -> None:
     assert score["status"] == "success"
     assert score["metric"] == "accuracy"
@@ -47,7 +52,7 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
     assert spec["partitions"]["validation"]["n_samples"] == 40
 
     raw_dir = output_root / "data" / "raw" / "synthetic_coupon"
-    # 内容故意不是合法 NPY；仅 train/validation 被配置引用，主循环不得触碰它。
+    # The deliberately invalid NPY belongs to test and is never read during development.
     with (raw_dir / "C_test_sentinel.npy").open("xb") as stream:
         stream.write(b"test partition must remain unread")
     original_open = Path.open
@@ -57,7 +62,7 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
         resolved = Path(path)
         if "test" in resolved.name.lower():
             attempted_test_reads.append(resolved)
-            raise AssertionError(f"主循环尝试读取测试分区：{resolved.name}")
+            raise AssertionError(f"The development loop attempted to read test: {resolved.name}")
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", audit_open)
@@ -72,6 +77,15 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
     assert summary["best_experiment_id"]
     assert summary["best_validation_accuracy"] is not None
     assert summary["test_evaluation"]["status"] == "not_requested"
+    assert summary["events_path"].endswith("/events.jsonl")
+    events = _events(output_root, summary)
+    assert events[0]["event_type"] == "session_started"
+    assert events[0]["status"] == "started"
+    assert events[-1]["event_type"] == "session_completed"
+    assert events[-1]["status"] == "success"
+    assert sum(event["event_type"] == "trial_started" for event in events) == 3
+    assert sum(event["event_type"] == "trial_completed" for event in events) == 3
+    assert any(event["event_type"] == "bundle_frozen" for event in events)
     bundle_path = output_root / summary["bundle_path"]
     assert bundle_path.is_file()
     history = _history(output_root, summary)
@@ -84,7 +98,7 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
         _assert_score(entry["evaluation"])
         assert entry["status"] == "success"
 
-    # 相同源摘要只复用 B 版本；验证复用前后清单字节完全一致。
+    # Identical sources reuse the unchanged package manifest.
     prepared_dir = output_root / "data" / "prepared" / "synthetic_coupon" / "demo_v1"
     package_result_path = prepared_dir / "package_result.json"
     previous_package_result = package_result_path.read_bytes()
@@ -138,7 +152,7 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
                 float(expected[f"p_{class_id}"]), abs=1e-12, rel=0
             )
 
-    # 修改源数据后，冻结 B 版本拒绝复用并保留原 package_result。
+    # Changing raw data prevents frozen package reuse.
     train_path = raw_dir / "C_train.npy"
     changed = np.load(train_path, allow_pickle=True)
     changed[0, 0] = int(changed[0, 0]) + 1
@@ -148,12 +162,12 @@ def test_demo_runs_three_real_trials_freezes_and_predicts_in_new_process(tmp_pat
         team_main.load_task_spec(config_path), output_root / "data" / "prepared"
     )
     assert rejected["status"] == "failed"
-    assert "变化" in rejected["error"]["message"] or "已变化" in rejected["error"]["message"]
+    assert "changed" in rejected["error"]["message"]
     assert package_result_path.read_bytes() == previous_package_result
 
 
 class OneShotController:
-    """小型替换 A：执行一次逻辑回归后停止。"""
+    """A test controller runs a single logistic baseline."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -165,9 +179,9 @@ class OneShotController:
                 "action": "run",
                 "model": "logistic_regression",
                 "params": {"C": 0.5, "max_iter": 500},
-                "reason": "可替换控制器执行一次基线。",
+                "reason": "Run one baseline.",
             }
-        return {"action": "stop", "reason": "替换控制器主动停止。"}
+        return {"action": "stop", "reason": "The test controller stopped."}
 
 
 def test_controller_and_real_evaluator_are_replaceable(tmp_path):
@@ -281,6 +295,12 @@ def test_final_test_runs_only_after_freeze_and_standalone_reuses_final_bundle(
     assert summary["test_evaluation"]["status"] == "success"
     assert summary["test_evaluation"]["metric"] == "accuracy"
     assert summary["test_evaluation"]["n_samples"] == 9
+    events = _events(output_root, summary)
+    assert [event["event_type"] for event in events][-3:] == [
+        "final_test_started",
+        "final_test_completed",
+        "session_completed",
+    ]
     assert len(test_reads) >= 2
     assert controller.calls == 2
     bundle_path = output_root / summary["bundle_path"]
@@ -292,7 +312,7 @@ def test_final_test_runs_only_after_freeze_and_standalone_reuses_final_bundle(
     assert report["selection_partition"] == "validation"
     assert (output_root / summary["test_evaluation"]["predictions_path"]).is_file()
     terminal = capsys.readouterr().out
-    assert "[最终方案]" in terminal
+    assert "[Final plan]" in terminal
     assert "[Validation] accuracy =" in terminal
     assert "[Test] accuracy =" in terminal
 
@@ -318,7 +338,6 @@ def test_final_test_failure_keeps_final_bundle_without_partial_refreeze(tmp_path
     config_path = create_demo(output_root, n_train=72, n_valid=24)
     raw_root = output_root / "data" / "raw" / "synthetic_coupon"
     X_valid = np.load(raw_root / "C_val.npy", allow_pickle=True)
-    y_valid = np.load(raw_root / "y_val.npy", allow_pickle=False)
     test_features = raw_root / "C_test.npy"
     test_labels = raw_root / "y_test.npy"
     np.save(test_features, X_valid[:6], allow_pickle=True)
@@ -344,6 +363,12 @@ def test_final_test_failure_keeps_final_bundle_without_partial_refreeze(tmp_path
     assert frozen_dirs[0].name.startswith("final_")
     report = read_json(output_root / summary["test_evaluation"]["report_path"])
     assert report["status"] == "failed"
+    events = _events(output_root, summary)
+    assert events[-1]["event_type"] == "session_completed"
+    assert events[-1]["status"] == "failed"
+    failure = next(event for event in events if event["event_type"] == "stage_failed")
+    assert failure["stage"] == "final_test"
+    assert failure["details"] == {"error_code": "FINAL_TEST_FAILED"}
 
 
 def test_configured_confirmation_trials_use_recorded_offset_seeds(tmp_path):
@@ -411,13 +436,13 @@ class TwoTrialController:
 
     def decide(self, context: dict[str, Any]) -> dict[str, Any]:
         if not self.decisions:
-            return {"action": "stop", "reason": "两轮候选已结束。"}
+            return {"action": "stop", "reason": "Both trials finished."}
         model, params = self.decisions.pop(0)
         return {
             "action": "run",
             "model": model,
             "params": params,
-            "reason": "验证评分异常隔离检查。",
+            "reason": "Test isolation after a scoring exception.",
         }
 
 

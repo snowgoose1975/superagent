@@ -1,4 +1,4 @@
-"""走真实 HTTP 适配/规划解析链，网络响应为 mock，分类训练和评分真实执行。"""
+"""Exercise planning, training, and scoring with mock HTTP responses."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ def _plan():
         {
             "model": "logistic_regression",
             "params": {"C": 0.5, "max_iter": 500},
-            "reason": "Synthetic mocked planning response.",
         }
     )
 
@@ -49,7 +48,7 @@ def test_school_single_mock_call_runs_real_c_d_and_marks_source(tmp_path):
     )
     assert summary["status"] == "success", summary
     assert summary["planner_mode"] == "school_llm"
-    assert summary["real_llm_calls"] == 0  # 模拟传输不得冒充真实调用
+    assert summary["real_llm_calls"] == 0  # Mock usage is counted separately.
     assert summary["attempted_trials"] == 1
     assert len(payloads) == 1
     prompt = json.dumps(payloads[0]["messages"])

@@ -319,13 +319,9 @@ class InputReaderTests(unittest.TestCase):
         self.assertEqual(filters["train"]["dropped_count"], 3)
         self.assertEqual(filters["train"]["reason_counts"], {
             "missing_image:photo": 1, "missing_text:review": 1, "missing_image_file:photo": 1})
-        final = materialize_final_test(discovered["test_descriptor_path"], self.area / "filtered_test")
-        config = json.loads(final.read_text(encoding="utf-8"))
-        self.assertEqual(config["n_samples"], 3)
-        np.testing.assert_array_equal(np.load(final.parent / "y_test.npy", allow_pickle=True), ["1", "0", "1"])
-        source_report = json.loads((final.parent / "test_source.json").read_text(encoding="utf-8"))
-        self.assertEqual(source_report["original_n_samples"], 4)
-        self.assertEqual(source_report["sample_filtering"]["dropped_count"], 1)
+        with self.assertRaisesRegex(ValueError, "Final test requires all 4 rows"):
+            materialize_final_test(discovered["test_descriptor_path"], self.area / "filtered_test")
+        self.assertFalse((self.area / "filtered_test" / "test_config.json").exists())
         (self.source / "new.csv").write_text(
             "id,photo,review,price\nkeep,pictures/test-1.png,good,10\n"
             "no-photo,,good,20\nno-text,pictures/test-2.png,   ,30\n"
@@ -445,7 +441,7 @@ class InputReaderTests(unittest.TestCase):
             with Image.open(path) as image:
                 color = image.getpixel((0, 0))
             Image.new("RGB", (48, 32), color).save(path)
-        for split, field in (("train", "photo"), ("val", "review"), ("test", "photo")):
+        for split, field in (("train", "photo"), ("val", "review")):
             path = self.source / f"{split}.csv"
             with path.open(encoding="utf-8", newline="") as stream:
                 rows = list(csv.DictReader(stream))
@@ -459,7 +455,7 @@ class InputReaderTests(unittest.TestCase):
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         self.assertEqual(summary["status"], "success", summary.get("error"))
         self.assertEqual(summary["test_evaluation"]["status"], "success")
-        self.assertEqual(summary["test_evaluation"]["n_samples"], 3)
+        self.assertEqual(summary["test_evaluation"]["n_samples"], 4)
         manifest = json.loads((output / summary["data_manifest_path"]).read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema_version"], "1.0")
         self.assertGreaterEqual(manifest["n_features"], 48 * 32 * 3)

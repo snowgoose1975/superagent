@@ -1,6 +1,6 @@
 {
   "mode": "offline_rules",
-  "strategy_source": "同学A：a-agent-v1/rule_based_hill_climb_v1",
+  "strategy_source": "Team A: a-agent-v1/rule_based_hill_climb_v1",
   "real_llm_calls": 0,
   "task_id": "in_vehicle_coupon_recommendation",
   "session_id": "session_20261112T145948Z_d83ebc17",

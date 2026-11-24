@@ -88,6 +88,8 @@ _BUDGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RESERVATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _LEDGER_SCHEMA_VERSION = "1.0"
 _MILLION = Decimal(1_000_000)
+COURSE_BUDGET_LIMIT_RMB = Decimal(20)
+COURSE_OFFPEAK_PROFILE_ID = COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21["profile_id"]
 
 
 def _now() -> str:
@@ -119,6 +121,43 @@ def _token_count(value: Any, field: str) -> int:
     if type(value) is not int or value < 0:
         raise TaskBudgetError(f"{field} must be a non-negative integer")
     return value
+
+
+def _usage_cost(profile: dict[str, Any], input_tokens: int, output_tokens: int) -> Decimal:
+    input_rate = _decimal(profile.get("input_cny_per_million"), "input_cny_per_million", positive=True)
+    output_rate = _decimal(profile.get("output_cny_per_million"), "output_cny_per_million", positive=True)
+    return (Decimal(input_tokens) * input_rate + Decimal(output_tokens) * output_rate) / _MILLION
+
+
+def course_offpeak_usage(data: dict[str, Any]) -> dict[str, Any]:
+    """Recalculate settled DeepSeek usage from a ledger without modifying it."""
+    profile = data.get("price_profile")
+    active_profile_id = profile.get("profile_id") if isinstance(profile, dict) else None
+    if not isinstance(active_profile_id, str) or active_profile_id not in _PROFILE_BY_ID:
+        return {}
+    known_inputs = known_outputs = unpriced_count = 0
+    for item in data["reservations"].values():
+        if item["status"] != "settled":
+            continue
+        input_tokens = item.get("actual_input_tokens")
+        output_tokens = item.get("actual_output_tokens")
+        profile_id = item.get("pricing_profile_id", active_profile_id)
+        if (
+            type(input_tokens) is not int or input_tokens < 0
+            or type(output_tokens) is not int or output_tokens < 0
+            or not isinstance(profile_id, str) or profile_id not in _PROFILE_BY_ID
+        ):
+            unpriced_count += 1
+            continue
+        known_inputs += input_tokens
+        known_outputs += output_tokens
+    cost = _usage_cost(COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21, known_inputs, known_outputs)
+    return {
+        "settled_input_tokens": known_inputs,
+        "settled_output_tokens": known_outputs,
+        "course_offpeak_unpriced_settled_count": unpriced_count,
+        "course_offpeak_settled_cost_rmb": format(cost, "f"),
+    }
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -186,6 +225,8 @@ class TaskBudgetLedger:
             raise TaskBudgetError("budget_id must be a simple safe identifier")
         self.budget_id = budget_id
         self._limit = _decimal(budget_rmb, "budget_rmb", positive=True)
+        if self._limit > COURSE_BUDGET_LIMIT_RMB:
+            raise TaskBudgetError("budget_rmb must not exceed CNY 20")
         if isinstance(profile, str):
             try:
                 profile_value = _PROFILE_BY_ID[profile]
@@ -227,6 +268,8 @@ class TaskBudgetLedger:
             raise TaskBudgetError("price profile ID is invalid")
         if type(profile["model_identity_verified_for_school_endpoint"]) is not bool:
             raise TaskBudgetError("price profile identity verification flag is invalid")
+        if not isinstance(profile["source_basis"], dict):
+            raise TaskBudgetError("price profile source_basis must be an object")
         for field in ("input_cny_per_million", "output_cny_per_million"):
             _decimal(profile[field], field, positive=True)
         if not isinstance(profile["sources"], list) or not all(
@@ -282,7 +325,7 @@ class TaskBudgetLedger:
             raise TaskBudgetError("task budget ledger is malformed; refusing to reset it")
         return value
 
-    def _validate_existing(self, data: dict[str, Any]) -> None:
+    def _validate_existing(self, data: dict[str, Any], *, allow_archived_profile: bool = False) -> None:
         if (
             data.get("schema_version") != _LEDGER_SCHEMA_VERSION
             or data.get("budget_id") != self.budget_id
@@ -297,7 +340,14 @@ class TaskBudgetLedger:
             previous_profile == COURSE_PRICE_PROFILE_PEAK_2026_10_21
             and self._profile == COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21
         )
-        if previous_profile != self._profile and not can_transition_peak_to_offpeak:
+        # A gateway which reserved at peak before another process migrated the
+        # ledger can still finalize that request. It cannot reserve another one.
+        archived_profile = (
+            allow_archived_profile
+            and self._profile == COURSE_PRICE_PROFILE_PEAK_2026_10_21
+            and previous_profile == COURSE_PRICE_PROFILE_OFFPEAK_2026_10_21
+        )
+        if previous_profile != self._profile and not can_transition_peak_to_offpeak and not archived_profile:
             raise TaskBudgetError(
                 "task budget ledger settings differ from this request; refusing to reset or reprice"
             )
@@ -350,10 +400,17 @@ class TaskBudgetLedger:
             except FileNotFoundError:
                 pass
 
-    def _cost(self, input_tokens: int, output_tokens: int) -> Decimal:
-        input_rate = Decimal(self._profile["input_cny_per_million"])
-        output_rate = Decimal(self._profile["output_cny_per_million"])
-        return (Decimal(input_tokens) * input_rate + Decimal(output_tokens) * output_rate) / _MILLION
+    @staticmethod
+    def _reservation_tariff(data: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        active_profile = data["price_profile"]
+        profile_id = item.get("pricing_profile_id", active_profile["profile_id"])
+        if profile_id == active_profile["profile_id"]:
+            return active_profile
+        for migration in reversed(data.get("profile_migrations", [])):
+            archived_profile = migration.get("from_profile")
+            if isinstance(archived_profile, dict) and archived_profile.get("profile_id") == profile_id:
+                return archived_profile
+        raise TaskBudgetError("reservation has no matching price profile")
 
     @staticmethod
     def _totals(data: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
@@ -389,7 +446,7 @@ class TaskBudgetLedger:
         output_bound = _token_count(max_output_tokens, "max_output_tokens")
         if input_bound + output_bound == 0:
             raise TaskBudgetError("request reservation must include a positive token bound")
-        amount = self._cost(input_bound, output_bound)
+        amount = _usage_cost(self._profile, input_bound, output_bound)
         with self._locked():
             data = self._read()
             self._validate_existing(data)
@@ -424,7 +481,7 @@ class TaskBudgetLedger:
         output_count = _token_count(output_tokens, "output_tokens")
         with self._locked():
             data = self._read()
-            self._validate_existing(data)
+            self._validate_existing(data, allow_archived_profile=True)
             try:
                 item = data["reservations"][reservation_id]
             except KeyError:
@@ -438,7 +495,7 @@ class TaskBudgetLedger:
                 raise TaskBudgetError("settled reservation cannot be changed")
             if item["status"] != "pending":
                 raise TaskBudgetError("unknown reservation cannot be settled")
-            cost = self._cost(input_count, output_count)
+            cost = _usage_cost(self._reservation_tariff(data, item), input_count, output_count)
             item.update(
                 {
                     "status": "settled",
@@ -457,7 +514,7 @@ class TaskBudgetLedger:
             raise TaskBudgetError("reason_code is invalid")
         with self._locked():
             data = self._read()
-            self._validate_existing(data)
+            self._validate_existing(data, allow_archived_profile=True)
             try:
                 item = data["reservations"][reservation_id]
             except KeyError:
@@ -474,7 +531,7 @@ class TaskBudgetLedger:
         """Return a consistent, safe accounting summary and immutable provenance."""
         with self._locked():
             data = self._read()
-            self._validate_existing(data)
+            self._validate_existing(data, allow_archived_profile=True)
             settled, reserved, remaining = self._totals(data)
             reservations = data["reservations"]
             return {
@@ -490,5 +547,6 @@ class TaskBudgetLedger:
                 "settled_count": sum(item["status"] == "settled" for item in reservations.values()),
                 "price_profile": data["price_profile"],
                 "profile_migrations": data.get("profile_migrations", []),
+                **course_offpeak_usage(data),
             }
 

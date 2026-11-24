@@ -42,7 +42,7 @@ class TaskDirectoryTests(unittest.TestCase):
             link.symlink_to(target)
         except OSError as exc:
             if getattr(exc, "winerror", None) == 1314:
-                self.skipTest("Windows 未授予符号链接权限；不修改系统设置")
+                self.skipTest("Windows has not granted symlink privileges")
             raise
 
     def setUp(self) -> None:
@@ -60,6 +60,19 @@ class TaskDirectoryTests(unittest.TestCase):
         (self.source / f"{prefix}_test.npy").write_bytes(b"must not open during discovery")
         (self.source / "y_test.npy").write_bytes(b"must not open during discovery")
         (self.source / "ReadMe.MD").write_text("Develop a classifier. Report test accuracy.", encoding="utf-8")
+
+    def test_pairwise_preference_requires_opposite_label_meanings(self):
+        from data_b.task_directory import _describes_pairwise_preference
+
+        self.assertTrue(_describes_pairwise_preference(
+            "The label is 1 if the left headline won and 0 if the right option won."
+        ))
+        self.assertTrue(_describes_pairwise_preference(
+            "Use 0 if A had the higher rate and 1 if B did."
+        ))
+        self.assertFalse(_describes_pairwise_preference(
+            "Classify label_pairwise as 1 if the texts are equivalent, 0 if they differ."
+        ))
 
     def test_npy_discovers_without_opening_test_and_matches_b_contract(self) -> None:
         self._npy_task()
@@ -161,7 +174,7 @@ class TaskDirectoryTests(unittest.TestCase):
             json.dumps({"feature_columns": ["x", "label"]}), encoding="utf-8")
         for split in ("train", "val", "test"):
             _csv(self.source / f"{split}.csv", ["x", "label"], [[1, 0], [2, 1]])
-        with self.assertRaisesRegex(TaskDirectoryError, "目标标签列不能作为输入"):
+        with self.assertRaisesRegex(TaskDirectoryError, "The target label cannot be used as an input"):
             discover_task_directory(self.source, self.area / "staged")
 
     def test_one_dimensional_strings_are_raw_text(self) -> None:
@@ -222,14 +235,14 @@ class TaskDirectoryTests(unittest.TestCase):
     def test_staging_cannot_write_inside_original_task(self) -> None:
         self._npy_task()
         destination = self.source / "generated"
-        with self.assertRaisesRegex(TaskDirectoryError, "原始任务目录之外"):
+        with self.assertRaisesRegex(TaskDirectoryError, "outside the read-only task directory"):
             discover_task_directory(self.source, destination)
         self.assertFalse(destination.exists())
 
     def test_unknown_metric_is_an_explicit_error(self) -> None:
         self._npy_task()
         (self.source / "info.json").write_text('{"metric": "auc"}', encoding="utf-8")
-        with self.assertRaisesRegex(TaskDirectoryError, "不支持的指标"):
+        with self.assertRaisesRegex(TaskDirectoryError, "unsupported metric"):
             discover_task_directory(self.source, self.area / "staged")
 
     def test_primary_metric_outranks_diagnostic_mentions(self) -> None:
@@ -240,8 +253,26 @@ class TaskDirectoryTests(unittest.TestCase):
         self.assertEqual(result["task_spec"]["primary_metric"]["name"], "f1_macro")
         (self.source / "ReadMe.MD").write_text(
             "The primary metric is ROC-AUC. Also print accuracy as a diagnostic.", encoding="utf-8")
-        with self.assertRaisesRegex(TaskDirectoryError, "不支持的主指标"):
+        with self.assertRaisesRegex(TaskDirectoryError, "unsupported metric"):
             discover_task_directory(self.source, self.area / "unsupported")
+
+    def test_primary_metric_in_chinese_overrides_diagnostic_accuracy(self) -> None:
+        self._npy_task()
+        (self.source / "ReadMe.MD").write_text(
+            "\u4e3b\u8981\u8bc4\u4f30\u6307\u6807\u4e3alog-loss\u3002 Report accuracy as a diagnostic.",
+            encoding="utf-8",
+        )
+        result = discover_task_directory(self.source, self.area / "supported_zh")
+        self.assertEqual(result["task_spec"]["primary_metric"]["name"], "log_loss")
+
+    def test_csv_preserves_padded_codes_and_literal_nan(self) -> None:
+        rows = ["code,label"] + [f"{code},{i % 2}" for i, code in enumerate(["001", "1", "nan"] * 4)]
+        (self.source / "train.csv").write_text("\n".join(rows), encoding="utf-8")
+        result = discover_task_directory(self.source, self.area / "staged_codes")
+        spec = result["task_spec"]
+        self.assertEqual(spec["feature_types"], {"code": "categorical"})
+        values = np.load(Path(spec["source_root"]) / "X_train.npy", allow_pickle=True)
+        self.assertEqual(set(values[:, 0]), {"001", "1", "nan"})
 
     def test_explicit_metadata_counts_are_checked(self) -> None:
         self._npy_task()
@@ -259,7 +290,7 @@ class TaskDirectoryTests(unittest.TestCase):
     def test_ambiguous_target_is_an_explicit_error(self) -> None:
         for split in ("train", "val", "test"):
             _csv(self.source / f"{split}.csv", ["x", "label", "target"], [[1, 0, 1], [2, 1, 0]])
-        with self.assertRaisesRegex(TaskDirectoryError, "唯一目标列"):
+        with self.assertRaisesRegex(TaskDirectoryError, "one target column"):
             discover_task_directory(self.source, self.area / "staged")
 
     def test_input_symlink_cannot_escape_task_root(self) -> None:
@@ -267,7 +298,7 @@ class TaskDirectoryTests(unittest.TestCase):
         self._symlink(self.source / "N_train.npy", self.area / "outside.npy")
         for name in ("N_val.npy", "N_test.npy", "y_train.npy", "y_val.npy", "y_test.npy"):
             (self.source / name).write_bytes(b"unread")
-        with self.assertRaisesRegex(TaskDirectoryError, "越出任务目录"):
+        with self.assertRaisesRegex(TaskDirectoryError, "escapes the task directory"):
             discover_task_directory(self.source, self.area / "staged")
 
     def test_test_path_is_checked_only_at_final_materialization(self) -> None:
@@ -279,7 +310,7 @@ class TaskDirectoryTests(unittest.TestCase):
         original = self.source / "N_test.npy"
         original.rename(self.source / "N_test.original")
         self._symlink(original, outside)
-        with self.assertRaisesRegex(TaskDirectoryError, "越出任务目录"):
+        with self.assertRaisesRegex(TaskDirectoryError, "escapes the task directory"):
             materialize_final_test(result["test_descriptor_path"], self.area / "test_input")
 
     def test_test_source_mutation_is_detected_before_writing_outputs(self) -> None:
@@ -299,7 +330,7 @@ class TaskDirectoryTests(unittest.TestCase):
             return values
 
         with patch.object(task_directory, "read_npy_array", mutating_read):
-            with self.assertRaisesRegex(TaskDirectoryError, "发生变化"):
+            with self.assertRaisesRegex(TaskDirectoryError, "changed"):
                 materialize_final_test(result["test_descriptor_path"], self.area / "test_input")
         self.assertFalse((self.area / "test_input" / "test_config.json").exists())
 

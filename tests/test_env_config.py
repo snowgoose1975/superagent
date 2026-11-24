@@ -1,4 +1,4 @@
-"""只读取测试创建的合成凭据，不接触真实项目 .env。"""
+"""Read synthetic credentials only."""
 
 from __future__ import annotations
 

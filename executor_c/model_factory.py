@@ -249,5 +249,9 @@ def build_estimator(
         from sklearn.feature_selection import VarianceThreshold
 
         steps.append(("feature_selector", VarianceThreshold(selector["params"]["threshold"])))
+    if representation == "dense_numeric" and model_id in {"logistic_regression", "linear_svc"}:
+        from sklearn.preprocessing import StandardScaler
+
+        steps.append(("scale", StandardScaler()))
     steps.append(("classifier", _classifier(model_id, normalized, seed)))
     return Pipeline(steps)

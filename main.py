@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,8 +26,9 @@ from executor_c.text_encoder import (
     encoder_status, prepare_weights,
 )
 from evaluation_d.school_gateway import GatewayError
+from evaluation_d.task_budget import COURSE_BUDGET_LIMIT_RMB, COURSE_OFFPEAK_PROFILE_ID
 from evaluation_d.metric_contracts import metric_in_domain, validate_metric_spec
-from executor_c.contracts import read_json, resolve_data_path, sha256_file, validate_plan, write_json
+from executor_c.contracts import ContractError, read_json, resolve_data_path, sha256_file, validate_plan, write_json
 from executor_c.diagnostics import safe_history_view
 from executor_c.executor import execute
 from executor_c.model_registry import default_pipeline, runtime_capabilities
@@ -128,12 +130,23 @@ def _prepared_budget_fingerprint(package: dict[str, Any]) -> str | None:
     ])
 
 
+def _split_source_paths(files: dict[str, Any] | None) -> set[str]:
+    if not files:
+        return set()
+    if "shards" in files:
+        return set().union(*(_split_source_paths(part) for part in files["shards"]))
+    paths = set(files.get("feature_paths", []))
+    paths.update(files[key] for key in ("csv_path", "labels_path") if files.get(key))
+    return paths
+
+
 def _automatic_budget_id(root: Path, discovery: dict[str, Any]) -> str:
     """Retain a task's previous ledger when moving from manual to automatic input."""
     fingerprint = discovery["budget_fingerprint"]
     default_id = "auto_" + fingerprint[:40]
     ledger_root = root / "sessions" / "task-budgets"
     candidates = {default_id} if (ledger_root / f"{default_id}.json").is_file() else set()
+    unresolved = set()
 
     def artifact(relative: Any, expected_name: str) -> Path:
         if (
@@ -153,10 +166,12 @@ def _automatic_budget_id(root: Path, discovery: dict[str, Any]) -> str:
         if not isinstance(accounting, dict) or not accounting.get("budget_id"):
             continue
         previous_fingerprint = historical.get("budget_fingerprint")
-        if previous_fingerprint is None and historical.get("discovery_path"):
+        prior_discovery = {}
+        if historical.get("discovery_path"):
             report = artifact(historical["discovery_path"], "task.discovery.json")
             if report.is_file():
-                previous_fingerprint = read_json(report).get("budget_fingerprint")
+                prior_discovery = read_json(report)
+                previous_fingerprint = previous_fingerprint or prior_discovery.get("budget_fingerprint")
         if previous_fingerprint is None and historical.get("data_manifest_path"):
             manifest = artifact(historical["data_manifest_path"], "data_manifest.json")
             package = artifact(
@@ -180,12 +195,15 @@ def _automatic_budget_id(root: Path, discovery: dict[str, Any]) -> str:
                     except (KeyError, OSError, ValueError):
                         digests = []
                     previous_fingerprint = _fingerprint_from_digests(digests)
-        same_task_without_fingerprint = (
-            previous_fingerprint is None and bool(discovery.get("task_id"))
-            and historical.get("task_id") == discovery["task_id"]
-        )
-        if previous_fingerprint == fingerprint or same_task_without_fingerprint:
+        same_name = bool(discovery.get("task_id")) and historical.get("task_id") == discovery["task_id"]
+        source_root = discovery.get("source_root")
+        same_source = bool(source_root) and prior_discovery.get("source_root") == source_root
+        if previous_fingerprint == fingerprint or (same_name and same_source):
             candidates.add(accounting["budget_id"])
+        elif same_name and not prior_discovery.get("source_root"):
+            unresolved.add(accounting["budget_id"])
+    if unresolved - candidates:
+        raise ValueError("Cannot verify historical ledgers for this task: " + ", ".join(sorted(unresolved - candidates)))
     if len(candidates) > 1:
         raise ValueError("Multiple historical ledgers match the same task")
     if candidates:
@@ -336,6 +354,22 @@ def _best_scored_trial(
         return None
     chooser = max if metric_spec["greater_is_better"] else min
     return chooser(successful, key=lambda item: item["evaluation"]["value"])
+
+
+def _decision_error(decision: Any, schema_version: str) -> str | None:
+    if not isinstance(decision, dict) or decision.get("action") not in ("run", "stop"):
+        return "A must return a run or stop decision"
+    reason = decision.get("reason")
+    if not isinstance(reason, str) or len(reason) > 2000:
+        return "The A decision reason must be a string of at most 2000 characters"
+    if decision["action"] == "stop":
+        return None if set(decision) == {"action", "reason"} else "The stop decision contains unknown fields"
+    required = {"action", "reason", "model", "params"}
+    if set(decision) not in (required, required | {"pipeline"}):
+        return "The run decision fields do not match the A interface"
+    if "pipeline" in decision and (schema_version == "1.0" or not isinstance(decision["pipeline"], dict)):
+        return "A pipeline requires TaskSpec 2.0 and must be an object"
+    return None
 
 
 def _execute_trial(
@@ -514,7 +548,7 @@ def run_project(
     events_path = session_dir / "events.jsonl"
     history_path.open("x", encoding="utf-8").close()
     planner = controller
-    scorer = evaluator if evaluator is not None else evaluate
+    scorer = evaluator if evaluator is not None else partial(evaluate, runs_root=root / "runs")
     mode = (
         getattr(planner, "mode", "injected_controller")
         if planner is not None
@@ -626,10 +660,15 @@ def run_project(
             if resolution is not None:
                 report = discovered["discovery_report"]
                 preflight_path = session_dir / "budget.discovery.json"
-                if preflight_path.is_file() and (
-                    report["budget_fingerprint"] != read_json(preflight_path)["budget_fingerprint"]
-                ):
-                    raise ValueError("B resolved different training inputs from the budget preflight")
+                if preflight_path.is_file():
+                    preflight_report = read_json(preflight_path)
+                    if report["budget_fingerprint"] != preflight_report["budget_fingerprint"]:
+                        raise ValueError("B resolved different training inputs from the budget preflight")
+                    for split in ("validation", "test"):
+                        field = f"{split}_files"
+                        verified = _split_source_paths(preflight_report.get(field))
+                        if verified and verified != _split_source_paths(report.get(field)):
+                            raise ValueError(f"B changed the {split} sources identified in task discovery")
                 budget_root = PROJECT_ROOT if gateway_factory is not None else root
                 expected_budget = _automatic_budget_id(budget_root, report)
                 current_budget = gateway.metadata()["task_budget"]["budget_id"]
@@ -822,6 +861,11 @@ def run_project(
             performance=performance,
         )
         summary["available_models"] = sorted(catalogue["models"])
+        def reject_decision(trial: int, message: str) -> None:
+            detail = {"trial": trial, "code": "PLAN_INVALID", "message": message}
+            summary.setdefault("rejected_decisions", []).append(detail)
+            log_event("planner_decision_rejected", stage="search", status="failed", details=detail)
+
         for trial in range(1, policy["max_trials"] + 1):
             elapsed = time.monotonic() - session_started
             if session_deadline_enabled:
@@ -855,7 +899,7 @@ def run_project(
                 },
                 "capabilities": trial_catalogue,
                 "history": history,
-                "remaining_trials": policy["max_trials"] - len(history),
+                "remaining_trials": policy["max_trials"] - trial + 1,
                 "search": {
                     "performance": performance,
                     "elapsed_seconds": round(elapsed, 3),
@@ -900,10 +944,10 @@ def run_project(
                     " Remaining trials use local rules.",
                     flush=True,
                 )
-            if not isinstance(decision, dict) or decision.get("action") not in ("run", "stop"):
-                raise ValueError("A must return a run or stop decision")
-            if not isinstance(decision.get("reason"), str) or len(decision["reason"]) > 2000:
-                raise ValueError("The A decision reason must be a string of at most 2000 characters")
+            decision_error = _decision_error(decision, spec["schema_version"])
+            if decision_error:
+                reject_decision(trial, decision_error)
+                continue
             log_event(
                 "planner_decision",
                 stage="search",
@@ -915,15 +959,8 @@ def run_project(
                 },
             )
             if decision["action"] == "stop":
-                if set(decision) != {"action", "reason"}:
-                    raise ValueError("The stop decision contains unknown fields")
                 summary["stop_reason"] = decision["reason"]
                 break
-            required_decision = {"action", "reason", "model", "params"}
-            if set(decision) not in (required_decision, required_decision | {"pipeline"}):
-                raise ValueError("The run decision fields do not match the A interface")
-            if spec["schema_version"] == "1.0" and "pipeline" in decision:
-                raise ValueError("TaskSpec 1.0 does not accept a Plan 2.0 pipeline")
             timeout_seconds = policy["timeout_seconds"]
             if session_deadline_enabled:
                 remaining_training = (
@@ -966,7 +1003,11 @@ def run_project(
                 plan_value["timeout_seconds"] = min(600, max(1, int(encoder_window - download_timeout)))
             else:
                 download_timeout = 0
-            plan = validate_plan(plan_value)
+            try:
+                plan = validate_plan(plan_value)
+            except ContractError:
+                reject_decision(trial, "A returned a plan rejected by the executor contract")
+                continue
             log_event(
                 "trial_started",
                 stage="search",
@@ -1035,7 +1076,8 @@ def run_project(
             summary["stop_reason"] = "trial_limit_reached"
         offsets = search_config["confirmation_seed_offsets"] if search_config else []
         if offsets:
-            remaining_trials = policy["max_trials"] - len(history)
+            rejected_trials = len(summary.get("rejected_decisions", []))
+            remaining_trials = policy["max_trials"] - len(history) - rejected_trials
             active_gateway = gateway if gateway is not None else getattr(planner, "gateway", None)
             usage_status = (
                 active_gateway.metadata().get("usage_status")
@@ -1086,7 +1128,7 @@ def run_project(
                         seen_recipes.add(recipe)
                         candidates.append(candidate)
                 requested = min(len(offsets), remaining_trials)
-                completed = 0
+                completed = successful = 0
                 if not candidates:
                     summary["confirmation_skipped_reason"] = "no_successful_candidate"
                 for index, offset in enumerate(offsets[:requested]):
@@ -1108,7 +1150,7 @@ def run_project(
                         timeout_seconds = policy["timeout_seconds"]
                     candidate = candidates[min(index, len(candidates) - 1)]
                     candidate_plan = candidate["plan"]
-                    trial = len(history) + 1
+                    trial = len(history) + rejected_trials + 1
                     experiment_id = f"exp_{session_id[-8:]}_{trial:03d}"
                     decision = {
                         "action": "run",
@@ -1191,7 +1233,10 @@ def run_project(
                         },
                     )
                     completed += 1
-                summary["confirmation_trials"] = completed
+                    successful += entry["status"] == "success"
+                summary["confirmation_attempted_trials"] = completed
+                summary["confirmation_trials"] = successful
+                summary["confirmation_failed_trials"] = completed - successful
                 if completed < requested and "confirmation_skipped_reason" not in summary:
                     summary["confirmation_skipped_reason"] = "not_all_requested_runs_completed"
             if "confirmation_skipped_reason" in summary:
@@ -1206,7 +1251,11 @@ def run_project(
                     "confirmation_completed",
                     stage="confirmation",
                     status="completed",
-                    details={"completed_trials": summary.get("confirmation_trials", 0)},
+                    details={
+                        "attempted_trials": summary.get("confirmation_attempted_trials", 0),
+                        "successful_trials": summary.get("confirmation_trials", 0),
+                        "failed_trials": summary.get("confirmation_failed_trials", 0),
+                    },
                 )
         log_event(
             "search_completed",
@@ -1305,7 +1354,7 @@ def run_project(
                     bundle, test_config_path, session_dir, **encoder_test_options,
                 )
                 summary["test_evaluation"] = {
-                    "status": "success",
+                    "status": test_report["status"],
                     "metric": test_report["metric"],
                     "value": test_report["value"],
                     "accuracy": test_report["accuracy"],
@@ -1317,9 +1366,15 @@ def run_project(
                     .relative_to(root)
                     .as_posix(),
                 }
+                submission = test_report["artifacts"].get("submission_path")
+                if submission:
+                    summary["test_evaluation"]["submission_path"] = (
+                        session_dir / submission
+                    ).relative_to(root).as_posix()
                 log_event(
                     "final_test_completed",
                     stage="final_test",
+                    status=test_report["status"],
                     details={
                         "metric": test_report["metric"],
                         "value": test_report["value"],
@@ -1337,6 +1392,8 @@ def run_project(
                     f"[Predictions] {(session_dir / 'test_predictions.csv').relative_to(root).as_posix()}",
                     flush=True,
                 )
+                if submission:
+                    print(f"[Submission] {summary['test_evaluation']['submission_path']}", flush=True)
             else:
                 log_event(
                     "final_test_not_requested",
@@ -1445,7 +1502,7 @@ def run_project(
         unavailable.append({"resource": ENCODER_ID, "reason": encoder["status"]})
     summary["unavailable_resources"] = unavailable
     if summary["status"] == "success" and require_complete and (
-        summary["trial_failures"] or unavailable
+        summary["trial_failures"] or unavailable or summary.get("rejected_decisions")
     ):
         summary["status"] = "degraded"
         print(
@@ -1459,8 +1516,23 @@ def run_project(
     summary["decision_sources"] = [entry["decision_source"] for entry in history]
     active_gateway = gateway if gateway is not None else getattr(planner, "gateway", None)
     if active_gateway is not None:
-        summary["llm_gateway"] = active_gateway.metadata()
-        summary["real_llm_calls"] = summary["llm_gateway"]["real_llm_calls"]
+        try:
+            metadata = active_gateway.metadata()
+            if not isinstance(metadata, dict) or type(metadata.get("real_llm_calls")) is not int:
+                raise ValueError("Gateway metadata is missing a valid call count")
+            summary["llm_gateway"] = metadata
+            summary["real_llm_calls"] = metadata["real_llm_calls"]
+            if metadata.get("task_budget_error"):
+                raise ValueError("Gateway task accounting is incomplete")
+        except Exception as exc:
+            summary["gateway_metadata_error"] = type(exc).__name__
+            summary["status"] = "failed"
+            if not summary.get("error"):
+                summary["error"] = {
+                    "code": "GATEWAY_METADATA_ERROR",
+                    "stage": "reporting",
+                    "message": "The gateway metadata could not be read. Inspect the API ledger.",
+                }
     if summary["status"] == "failed" and summary.get("error"):
         error = summary["error"]
         if error.get("stage") != "final_test":
@@ -1517,8 +1589,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--billing-profile",
         choices=(
-            "deepseek-v4.1-flash-offpeak-2026-10-21",
-            "deepseek-v4.1-flash-peak-2026-10-21",
+            COURSE_OFFPEAK_PROFILE_ID,
         ),
         help="Select the reference tariff for the task ledger",
     )
@@ -1572,6 +1643,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(line, flush=True)
             print(f"[Report] {output_dir / 'test_evaluation.json'}", flush=True)
             print(f"[Predictions] {output_dir / 'test_predictions.csv'}", flush=True)
+            if submission := report["artifacts"].get("submission_path"):
+                print(f"[Submission] {output_dir / submission}", flush=True)
             return 0
         if args.task is not None and args.test_config is not None:
             raise ValueError("--task discovers the test split. Omit --test-config")
@@ -1582,7 +1655,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.performance and args.planner == "school" and not automatic:
             raise ValueError("School performance mode requires --task for the task budget ledger")
         if automatic and args.planner == "school":
-            billing_profile = billing_profile or "deepseek-v4.1-flash-offpeak-2026-10-21"
+            billing_profile = billing_profile or COURSE_OFFPEAK_PROFILE_ID
         elif bool(billing_profile) != bool(args.task_budget_id):
             raise ValueError("Provide --billing-profile and --task-budget-id together")
         if billing_profile and args.planner != "school":
@@ -1596,23 +1669,23 @@ def main(argv: list[str] | None = None) -> int:
             max_calls = args.llm_max_calls if args.llm_max_calls is not None else (20 if automatic else 1)
             budget_rmb = args.llm_budget_rmb if args.llm_budget_rmb is not None else ("20" if automatic else "0.10")
 
-            if automatic:
-                for field, amount in (
-                    ("--task-budget-rmb", args.task_budget_rmb), ("--llm-budget-rmb", budget_rmb),
-                ):
-                    try:
-                        parsed = Decimal(amount)
-                    except InvalidOperation:
-                        raise ValueError(f"{field} requires a valid amount") from None
-                    if not parsed.is_finite() or not 0 < parsed <= 20:
-                        raise ValueError(f"{field} must be greater than zero and at most CNY 20")
+            for field, amount in (
+                ("--task-budget-rmb", args.task_budget_rmb), ("--llm-budget-rmb", budget_rmb),
+            ):
+                try:
+                    parsed = Decimal(amount)
+                except InvalidOperation:
+                    raise ValueError(f"{field} requires a valid amount") from None
+                if not parsed.is_finite() or not 0 < parsed <= COURSE_BUDGET_LIMIT_RMB:
+                    raise ValueError(f"{field} must be greater than zero and at most CNY 20")
 
             def make_gateway(spec: dict[str, Any] | None, session_dir: Path) -> Any:
                 config = read_json(args.llm_config, error_code="API_CONFIG_INVALID")
                 if billing_profile:
                     print(f"[Task budget tariff] {billing_profile}", flush=True)
-                if config.get("pricing_profile"):
-                    print(f"[Gateway cost estimate] {config['pricing_profile']}", flush=True)
+                gateway_tariff = billing_profile or config.get("pricing_profile")
+                if gateway_tariff:
+                    print(f"[Gateway cost estimate] {gateway_tariff}", flush=True)
                 # Load settings only from this project's .env after budget routing.
                 task_budget = None
                 if billing_profile:

@@ -1,4 +1,4 @@
-"""Score a frozen final bundle once on a separately configured test partition."""
+"""Predict on a separate test partition and score it when labels are available."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 
 from data_b.npy_reader import read_npy_array
 from data_b.raw_reader import typed_category_token
+from data_b.sample_index import load_sample_index
 from evaluation_d.metric_contracts import score_predictions, validate_metric_spec
 from executor_c.contracts import read_json, resolve_data_path, sha256_file, write_json
 from predict import predict_bundle
@@ -31,7 +32,9 @@ class FinalTestError(ValueError):
     code = "FINAL_TEST_FAILED"
 
 
-def _load_test_config(config_path: str | Path, expected_task_id: str) -> tuple[dict[str, Any], Path, Path]:
+def _load_test_config(
+    config_path: str | Path, expected_task_id: str,
+) -> tuple[dict[str, Any], Path, Path | None]:
     path = Path(config_path).expanduser().resolve(strict=True)
     config = read_json(path, error_code="FINAL_TEST_CONFIG_INVALID")
     if set(config) != _TEST_CONFIG_FIELDS or config.get("schema_version") != "1.0":
@@ -49,13 +52,14 @@ def _load_test_config(config_path: str | Path, expected_task_id: str) -> tuple[d
     if not root.is_dir():
         raise ValueError("The test source_root must be an existing directory")
     features = resolve_data_path(root, config["features_path"])
-    labels = resolve_data_path(root, config["labels_path"])
+    relative_labels = config["labels_path"]
+    labels = resolve_data_path(root, relative_labels) if relative_labels is not None else None
     if features == labels:
         raise ValueError("Test features and labels must be in separate files")
     return config, features, labels
 
 
-def _load_encoded_labels(labels_path: Path, mapping: dict[str, Any], class_ids: list[int]) -> list[int]:
+def _validated_label_values(mapping: dict[str, Any], class_ids: list[int]) -> list[Any]:
     label_values = mapping.get("label_values")
     classes = mapping.get("classes")
     if (
@@ -69,7 +73,14 @@ def _load_encoded_labels(labels_path: Path, mapping: dict[str, Any], class_ids: 
     tokens = [typed_category_token(value) for value in label_values]
     if any(not isinstance(token, str) for token in tokens) or len(set(tokens)) != len(tokens):
         raise ValueError("The frozen label mapping contains invalid or duplicate source class values")
-    label_to_id = {token: class_id for token, class_id in zip(tokens, class_ids, strict=True)}
+    return label_values
+
+
+def _load_encoded_labels(labels_path: Path, label_values: list[Any], class_ids: list[int]) -> list[int]:
+    label_to_id = {
+        typed_category_token(value): class_id
+        for value, class_id in zip(label_values, class_ids, strict=True)
+    }
     raw = read_npy_array(labels_path)
     if raw.ndim != 1:
         raise ValueError("Test labels must be a one-dimensional array")
@@ -109,6 +120,25 @@ def _read_predictions(path: Path, class_ids: list[int]) -> tuple[list[int], list
         y_pred.append(label)
         probabilities.append(probability)
     return y_pred, probabilities
+
+
+def _write_submission(
+    destination: Path, config: dict[str, Any], source: dict[str, Any] | None,
+    y_pred: list[int], label_values: list[Any],
+) -> Path:
+    part = {"features_path": config["features_path"], "n_samples": config["n_samples"]}
+    if source is not None:
+        part["sample_ids_path"] = source["sample_index_path"]
+    sample_index, provenance = load_sample_index(destination / "test_input", part, "test")
+    if source is not None and provenance["sample_index"]["sha256"] != source["sample_index_sha256"]:
+        raise ValueError("The test sample index differs from the raw test source")
+    output = destination / "submission_predictions.csv"
+    with output.open("x", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["sample_id", "prediction"])
+        for sample, prediction in zip(sample_index, y_pred, strict=True):
+            writer.writerow([sample["original_id"] or sample["sample_id"], label_values[prediction]])
+    return output
 
 
 def evaluate_frozen_bundle(
@@ -167,9 +197,10 @@ def evaluate_frozen_bundle(
         )
         config_hash = sha256_file(Path(test_config_path).expanduser().resolve(strict=True))
         feature_hash = sha256_file(features_path)
-        labels_hash = sha256_file(labels_path)
+        labels_hash = sha256_file(labels_path) if labels_path is not None else None
         mapping_path = resolve_data_path(bundle_file.parent, bundle["artifacts"]["label_mapping_path"])
         mapping = read_json(mapping_path, error_code="FINAL_BUNDLE_INVALID")
+        label_values = _validated_label_values(mapping, class_ids)
 
         if "encoder.json" in bundle["hashes"]:
             try:
@@ -187,19 +218,19 @@ def evaluate_frozen_bundle(
                 raise ValueError("Final test encoder inference failed. Check dependencies, the cache, and the frozen manifest.")
         else:
             predict_bundle(bundle_file, features_path, predictions_path, id_prefix="test")
-        y_true = _load_encoded_labels(labels_path, mapping, class_ids)
         y_pred, probabilities = _read_predictions(predictions_path, class_ids)
-        if (
-            len(y_true) != config["n_samples"]
-            or len(y_pred) != config["n_samples"]
-            or len(y_true) != len(y_pred)
-        ):
-            raise ValueError("Test feature or label row count differs from n_samples")
-        metric_value = score_predictions(metric["name"], y_true, y_pred, probabilities, class_ids)
-        accuracy = score_predictions("accuracy", y_true, y_pred, probabilities, class_ids)
+        if len(y_pred) != config["n_samples"]:
+            raise ValueError("Test prediction row count differs from n_samples")
+        metric_value = accuracy = None
+        if labels_path is not None:
+            y_true = _load_encoded_labels(labels_path, label_values, class_ids)
+            if len(y_true) != config["n_samples"]:
+                raise ValueError("Test label row count differs from n_samples")
+            metric_value = score_predictions(metric["name"], y_true, y_pred, probabilities, class_ids)
+            accuracy = score_predictions("accuracy", y_true, y_pred, probabilities, class_ids)
         if (
             sha256_file(features_path) != feature_hash
-            or sha256_file(labels_path) != labels_hash
+            or (labels_path is not None and sha256_file(labels_path) != labels_hash)
             or sha256_file(Path(test_config_path).expanduser().resolve(strict=True)) != config_hash
         ):
             raise ValueError("Test inputs or configuration changed during evaluation")
@@ -210,13 +241,13 @@ def evaluate_frozen_bundle(
             "session_id": bundle["session_id"],
             "final_id": bundle["final_id"],
             "experiment_id": bundle["experiment_id"],
-            "status": "success",
+            "status": "success" if labels_path is not None else "predicted",
             "selection_partition": "validation",
             "metric": metric["name"],
             "value": metric_value,
             "greater_is_better": metric["greater_is_better"],
             "accuracy": accuracy,
-            "n_samples": len(y_true),
+            "n_samples": len(y_pred),
             "artifacts": {
                 "predictions_path": predictions_path.name,
                 "bundle_sha256": sha256_file(bundle_file),
@@ -228,6 +259,10 @@ def evaluate_frozen_bundle(
         }
         if source_inputs is not None:
             report["artifacts"]["source_inputs"] = source_inputs
+        if labels_path is None:
+            submission = _write_submission(destination, config, source_inputs, y_pred, label_values)
+            report["artifacts"]["submission_path"] = submission.name
+            report["artifacts"]["submission_sha256"] = sha256_file(submission)
         write_json(report_path, report)
         return report
     except Exception as exc:
@@ -257,15 +292,17 @@ def evaluate_frozen_bundle(
 
 def format_test_result(report: dict[str, Any]) -> list[str]:
     """Terminal lines for the configured metric and the familiar accuracy score."""
+    if report.get("status") == "predicted":
+        return [f"[Test] Generated {report['n_samples']} predictions. Test labels are unavailable."]
     if report.get("status") != "success":
         return [f"[Test] Failed: {report.get('error', {}).get('message', 'Unknown error')}"]
     n_samples = report["n_samples"]
     metric = report["metric"]
     lines = []
     if metric == "accuracy":
-        lines.append(f"[Test] accuracy = {report['value']:.6f} ({report['value']:.2%})，n = {n_samples}")
+        lines.append(f"[Test] accuracy = {report['value']:.6f} ({report['value']:.2%}), n = {n_samples}")
     else:
-        lines.append(f"[Test] {metric} = {report['value']:.6f}，n = {n_samples}")
-        lines.append(f"[Test] accuracy = {report['accuracy']:.6f} ({report['accuracy']:.2%})，n = {n_samples}")
+        lines.append(f"[Test] {metric} = {report['value']:.6f}, n = {n_samples}")
+        lines.append(f"[Test] accuracy = {report['accuracy']:.6f} ({report['accuracy']:.2%}), n = {n_samples}")
     return lines
 

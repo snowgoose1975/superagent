@@ -302,7 +302,9 @@ class SchoolAController(PackageAController):
             self._call_gateway,
             self.planner,
             log=self._events,
-            max_input_bytes=self.gateway_metadata.get("max_input_tokens", 16_384),
+            max_input_bytes=self.gateway_metadata.get(
+                "max_input_bytes", self.gateway_metadata.get("max_input_tokens", 16_384)
+            ),
         )
 
     def _call_gateway(self, messages: list[dict[str, str]]) -> dict[str, Any]:
