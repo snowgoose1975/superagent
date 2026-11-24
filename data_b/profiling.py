@@ -5,9 +5,12 @@ import numpy as np
 import pandas as pd
 
 
-def table_profile(frame: pd.DataFrame, feature_types: dict[str, str]) -> dict:
+def table_profile(frame: pd.DataFrame, feature_types: dict[str, str], *, column_cache: dict | None = None) -> dict:
     fields = []
     for name in frame:
+        if column_cache is not None and name in column_cache:
+            fields.append(column_cache[name])
+            continue
         values = frame[name]
         missing = values.isna()
         unique = int(values.nunique(dropna=True))
@@ -23,6 +26,8 @@ def table_profile(frame: pd.DataFrame, feature_types: dict[str, str]) -> dict:
         if feature_types[name] == "text":
             field["length"] = length_statistics(values.fillna("").tolist())
         fields.append(field)
+        if column_cache is not None:
+            column_cache[name] = field
     # Detailed fields stay on disk. A receives a bounded summary and selected fields.
     total = sum(field["missing_count"] for field in fields)
     return {"column_statistics": fields,

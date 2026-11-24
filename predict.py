@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import csv
 import tempfile
+import uuid
 from pathlib import Path
 
 import joblib
 import numpy as np
+
 from data_b.modality_readers import (
     combine_text_columns,
     load_image_tensor,
@@ -26,6 +28,8 @@ def predict_bundle(
     id_prefix: str = "prediction",
     *,
     pretrained: str = "cache-only",
+    raw_input: bool = False,
+    source_root: str | Path | None = None,
 ) -> Path:
     """Apply the frozen transformer and classifier to new data and emit class IDs and probabilities."""
     path = Path(bundle_path).resolve()
@@ -39,6 +43,19 @@ def predict_bundle(
         artifact = resolve_data_path(path.parent, name)
         if sha256_file(artifact) != expected:
             raise ValueError("A frozen artifact checksum does not match")
+    if raw_input:
+        from data_b.input_readers import normalize_prediction_input
+
+        if "reader_rules.json" not in bundle["hashes"] or source_root is None:
+            raise ValueError("Raw inference requires frozen reader_rules.json and source_root")
+        root = Path(source_root).resolve(strict=True)
+        features = Path(features_path).resolve(strict=True)
+        if not features.is_relative_to(root):
+            raise ValueError("Raw prediction source must be inside source_root")
+        normalized = Path(output_path).resolve().parent / ("converted_" + uuid.uuid4().hex) / "X.npy"
+        normalize_prediction_input(path.parent / "reader_rules.json", root,
+                                   features.relative_to(root).as_posix(), normalized)
+        features_path = normalized
     if not isinstance(id_prefix, str) or not id_prefix or any(c in id_prefix for c in "\r\n\0"):
         raise ValueError("id_prefix must be a nonempty single-line string")
     if bundle.get("ensemble"):
@@ -101,7 +118,11 @@ def predict_bundle(
             )
             pipeline = normalize_pipeline(representation, frozen_plan.get("pipeline", {}))
             if "text_encoder" in pipeline:
-                from executor_c.text_encoder import LocalTextEncoder, encoder_manifest, prepare_weights
+                from executor_c.text_encoder import (
+                    LocalTextEncoder,
+                    encoder_manifest,
+                    prepare_weights,
+                )
 
                 if "encoder.json" not in bundle["hashes"]:
                     raise ValueError("The frozen plan lacks an encoder resource manifest")
@@ -178,9 +199,12 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--id-prefix", default="prediction")
     parser.add_argument("--pretrained", choices=("cache-only", "download"), default="cache-only")
+    parser.add_argument("--raw-input", action="store_true", help="Apply the frozen B input adapter before prediction")
+    parser.add_argument("--source-root", type=Path, help="Root for raw file/image references")
     args = parser.parse_args()
     print(predict_bundle(
         args.bundle, args.features, args.output, args.id_prefix, pretrained=args.pretrained,
+        raw_input=args.raw_input, source_root=args.source_root,
     ))
 
 

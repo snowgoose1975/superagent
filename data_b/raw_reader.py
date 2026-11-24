@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .npy_reader import read_npy_array
+from .npy_reader import ReaderLimits, read_npy_array
 
 
 def _is_missing(value: Any) -> bool:
@@ -67,7 +67,9 @@ def _numeric_column(values: np.ndarray, name: str) -> np.ndarray:
 
 
 def _read_matrix(path: Path, feature_columns: list[str]) -> np.ndarray:
-    values = read_npy_array(path)
+    # A declared mixed-image matrix can have one numeric column per RGB pixel.
+    # Keep the generic NPY limits; widen only the explicit column contract.
+    values = read_npy_array(path, ReaderLimits(max_columns=max(4096, len(feature_columns))))
     if values.ndim != 2 or values.shape[1] != len(feature_columns):
         raise ValueError(f"Feature array {path.name} dimensions do not match feature_columns")
     return values

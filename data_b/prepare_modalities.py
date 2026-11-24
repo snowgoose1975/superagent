@@ -18,9 +18,9 @@ from .modality_readers import (
     validate_image_spec,
     write_text_matrix_jsonl,
 )
-from .npy_reader import read_npy_array
+from .npy_reader import normalize_classification_labels, read_npy_array
+from .prepare import TrainingData, load_training_data
 from .raw_reader import typed_category_token
-from .profiling import modality_profile
 from .sample_index import load_sample_index, save_combined_index
 
 _ARTIFACTS = (
@@ -208,7 +208,7 @@ def _load_split(
             spec["modality"]["channel_layout"],
             spec["modality"]["value_range"],
         )
-    y = read_npy_array(label_path)
+    y = normalize_classification_labels(read_npy_array(label_path))
     if y.ndim != 1 or len(y) != split["n_samples"] or len(X) != split["n_samples"]:
         raise ValueError(f"{split_name} features or labels do not match n_samples")
     after = {"features": _sha256(feature_path), "labels": _sha256(label_path)}
@@ -230,6 +230,7 @@ def _signature(spec: dict[str, Any], source_hashes: dict[str, Any]) -> str:
         name: _sha256(Path(__file__).with_name(name))
         for name in (
             "prepare_modalities.py",
+            "prepare.py",
             "modality_readers.py",
             "npy_reader.py",
             "raw_reader.py",
@@ -290,7 +291,9 @@ def _save_npy(path: Path, values: np.ndarray) -> None:
         np.save(stream, values, allow_pickle=False)
 
 
-def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, Any]:
+def prepare_modalities(
+    task_spec: dict[str, Any], data_root: str | Path, *, training_data: TrainingData | None = None,
+) -> dict[str, Any]:
     """Prepare a versioned v2.0 raw-text or image-tensor B package."""
     fresh: Path | None = None
     try:
@@ -299,7 +302,8 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
         if not directory.exists():
             directory.mkdir(parents=True, exist_ok=False)
             fresh = directory
-        X_train_raw, y_train_raw, train_hashes, train_index = _load_split(source_root, spec, "train")
+        training = load_training_data(task_spec, reuse=training_data)
+        X_train_raw, y_train_raw = training.features, training.labels
         X_valid_raw, y_valid_raw, valid_hashes, valid_index = _load_split(source_root, spec, "validation")
         label_tokens = [typed_category_token(item) for item in spec["label_values"]]
         label_to_id = {token: index for index, token in enumerate(label_tokens)}
@@ -318,7 +322,7 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
 
         y_train = encode(y_train_raw, "train", True)
         y_valid = encode(y_valid_raw, "validation", False)
-        source_hashes = {"train": train_hashes, "validation": valid_hashes}
+        source_hashes = {"train": training.hashes, "validation": valid_hashes}
         signature = _signature(spec, source_hashes)
         if fresh is None:
             return _cache(directory, signature)
@@ -371,10 +375,10 @@ def prepare_modalities(task_spec: dict[str, Any], data_root: str | Path) -> dict
                 "feature_names": feature_names,
                 "image_shape": spec["modality"].get("image_shape"),
                 "train_label_counts": train_counts,
-                **modality_profile(X_train_raw, spec["modality"]),
+                **training.profile,
             },
         )
-        save_combined_index(metadata_dir / "sample_index.csv", train_index, valid_index)
+        save_combined_index(metadata_dir / "sample_index.csv", training.index, valid_index)
         mapping = {
             "classes": classes,
             "label_values": spec["label_values"],
