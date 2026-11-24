@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -151,4 +151,6 @@ def load_image_tensor(
         raise ValueError("Image NPY pixels must be finite integers or floating-point values")
     if (values < limits[0]).any() or (values > limits[1]).any():
         raise ValueError("Image pixels exceed the declared value_range")
-    return np.asarray(values, dtype=np.float32)
+    # C's image transforms choose the numeric representation. Preserve source
+    # pixels here instead of allocating a whole float32 copy during B staging.
+    return values

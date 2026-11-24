@@ -546,7 +546,7 @@ class InputReaderTests(unittest.TestCase):
                   for field in ("train", "target_column", "metric")], "unresolved_questions": []}
         layout["target_column"] = "other"
         with self.assertRaises(AnalysisError):
-            resolve_layout(self.source, Replies([layout, layout]), self.area / "analysis",
+            resolve_layout(self.source, Replies([layout] * 4), self.area / "analysis",
                            document_paths=["instructions.md"])
 
     def test_program_selects_flat_json_conversion_from_semantics_and_leaves_test_unread(self):

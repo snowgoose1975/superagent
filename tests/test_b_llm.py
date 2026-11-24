@@ -14,6 +14,7 @@ import joblib
 import numpy as np
 
 import main as team_main
+from data_b import prepare as b_prepare
 from data_b.llm_analysis import (
     AnalysisError,
     _append_correction,
@@ -129,6 +130,29 @@ class BLLMTests(unittest.TestCase):
         self.discover(gateway)
         self.assertEqual(gateway.metadata()["call_attempts"], 2)
 
+    def test_layout_can_succeed_on_fourth_attempt_with_latest_feedback(self):
+        invalid_replies = []
+        for index in range(3):
+            invalid = self.layout()
+            invalid["partitions"]["train"]["features"] = [f"records/missing_{index}.csv"]
+            invalid_replies.append(invalid)
+        gateway = self.gateway([*invalid_replies, self.layout()])
+        self.discover(gateway)
+        self.assertEqual(gateway.metadata()["call_attempts"], 4)
+        for index, request in enumerate(self.requests[1:]):
+            messages = request["messages"]
+            self.assertEqual(messages[:2], self.requests[0]["messages"])
+            self.assertEqual(len(messages), 4)
+            self.assertEqual(json.loads(messages[2]["content"]), invalid_replies[index])
+            self.assertIn(f"records/missing_{index}.csv", messages[3]["content"])
+
+    def test_layout_corrections_stop_at_shared_call_limit(self):
+        gateway = self.gateway([{"wrong": True}] * 2, max_calls=2)
+        with self.assertRaises(GatewayError) as error:
+            self.discover(gateway)
+        self.assertEqual(error.exception.code, "CALL_LIMIT")
+        self.assertEqual(len(self.requests), 2)
+
     def test_prompt_asks_for_semantics_and_legacy_numpy_options_remain_checked(self):
         invalid = self.layout()
         invalid["reader_options"] = {"allow_pickle": True}
@@ -169,29 +193,32 @@ class BLLMTests(unittest.TestCase):
     def test_fabricated_evidence_is_rejected(self):
         value = self.layout()
         value["evidence"][0]["quote"] = "invented statement"
-        gateway = self.gateway([value, value])
-        with self.assertRaises(AnalysisError):
+        gateway = self.gateway([value] * 4)
+        with self.assertRaisesRegex(AnalysisError, "after 4 attempts"):
             resolve_layout(self.source, gateway, self.area / "analysis", document_paths=["使用说明.md"])
+        self.assertEqual(gateway.metadata()["call_attempts"], 4)
+        self.assertEqual(len(list((self.area / "analysis").glob("layout_invalid_*.json"))), 4)
+        self.assertFalse((self.area / "analysis/layout.json").exists())
         self.assertFalse((self.area / "analysis_staging").exists())
 
     def test_train_test_overlap_is_rejected(self):
         value = self.layout()
         value["partitions"]["test"]["features"] = ["records/development.csv"]
-        gateway = self.gateway([value, value])
+        gateway = self.gateway([value] * 4)
         with self.assertRaises(AnalysisError):
             resolve_layout(self.source, gateway, self.area / "analysis", document_paths=["使用说明.md"])
 
     def test_missing_metric_is_not_defaulted(self):
         value = self.layout()
         value["metric"] = None
-        gateway = self.gateway([value, value])
+        gateway = self.gateway([value] * 4)
         with self.assertRaises(AnalysisError):
             resolve_layout(self.source, gateway, self.area / "analysis", document_paths=["使用说明.md"])
 
     def test_unsupported_format_is_not_silently_converted(self):
         value = self.layout()
         value["format"] = "parquet"
-        gateway = self.gateway([value, value])
+        gateway = self.gateway([value] * 4)
         with self.assertRaises(AnalysisError):
             resolve_layout(self.source, gateway, self.area / "analysis", document_paths=["使用说明.md"])
 
@@ -402,11 +429,15 @@ class BLLMTests(unittest.TestCase):
         value = self.layout()
         value["partitions"]["test"] = None
         gateway = self.gateway([value, self.quality(), {"model": "logistic_regression", "params": {}}])
-        summary_path = team_main.run_project(task_directory=self.source, output_root=self.area / "output",
-                                            planner_mode="school", gateway=gateway, max_trials=1, b_analysis="llm",
-                                            task_documents=["使用说明.md"])
+        with (patch.object(b_prepare, "_load_partition", wraps=b_prepare._load_partition) as load_partition,
+              patch.object(b_prepare, "table_profile", wraps=b_prepare.table_profile) as profile):
+            summary_path = team_main.run_project(task_directory=self.source, output_root=self.area / "output",
+                                                planner_mode="school", gateway=gateway, max_trials=1, b_analysis="llm",
+                                                task_documents=["使用说明.md"])
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         self.assertEqual(summary["status"], "success", summary.get("error"))
+        self.assertEqual([call.args[1] for call in load_partition.call_args_list], ["train", "validation"])
+        self.assertEqual(profile.call_count, 1)
         self.assertEqual(summary["llm_gateway"]["call_attempts"], 3)
         self.assertNotIn("sealed.csv", json.dumps(self.requests[2]["messages"]))
         spec = json.loads((summary_path.parent / "task.snapshot.json").read_text(encoding="utf-8"))
@@ -419,6 +450,23 @@ class BLLMTests(unittest.TestCase):
         with predicted.open(encoding="utf-8", newline="") as stream:
             rows = list(csv.reader(stream))
         self.assertEqual(len(rows), 13)
+
+    def test_training_change_during_review_invalidates_loaded_partition(self):
+        gateway = self.gateway([self.layout(), self.quality()])
+        resolution, discovered = self.discover(gateway)
+        original = discovered["task_spec"]
+        training = b_prepare.load_training_data(original)
+        spec, _ = review_quality(original, gateway, self.area / "analysis", resolution["documents"],
+                                 training_data=training)
+        index = Path(spec["source_root"]) / spec["partitions"]["train"]["sample_ids_path"]
+        with index.open("ab") as stream:
+            stream.write(b"\n")
+
+        result = prepare_data(spec, self.area / "prepared", training_data=training)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Training source files changed after quality review", result["error"]["message"])
+        self.assertIsNone(result["data_manifest_path"])
 
     def test_semantic_text_image_and_mixed_tasks_run_without_reader_llm_round(self):
         from PIL import Image

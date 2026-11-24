@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from .npy_reader import read_npy_array
+from .npy_reader import normalize_classification_labels, read_npy_array
 from .raw_reader import typed_category_token
 from .sample_index import save_sample_index
 
@@ -69,7 +69,13 @@ def _filter_array_samples(values, labels, sample_rows, reader, split):
     if len(values) != len(labels) or len(values) != len(sample_rows):
         raise TaskDirectoryError("Features, labels and sample IDs have different row counts")
     if reader["output_kind"] == "image":
-        reasons = [["missing_image"] if all(_missing_content(value) for value in image.flat) else [] for image in values]
+        if values.dtype.kind in "biu":
+            reasons = [[] for _ in values]
+        elif values.dtype.kind == "f":
+            missing = np.isnan(values).reshape(len(values), -1).all(axis=1)
+            reasons = [["missing_image"] if value else [] for value in missing]
+        else:
+            reasons = [["missing_image"] if all(_missing_content(value) for value in image.flat) else [] for image in values]
     else:
         columns = reader["feature_columns"]
         kinds = reader["feature_types"]
@@ -77,6 +83,8 @@ def _filter_array_samples(values, labels, sample_rows, reader, split):
         reasons = [[f"missing_text:{name}" for index, name in text_indices if _missing_content(row[index])]
                    for row in values]
     kept = _keep_present_samples(reader, split, sample_rows, reasons)
+    if len(kept) == len(values):
+        return values, labels, sample_rows
     return values[kept], labels[kept], [sample_rows[index] for index in kept]
 
 
@@ -130,6 +138,7 @@ def _scalar(value: Any) -> Any:
 
 
 def _labels(values: np.ndarray) -> np.ndarray:
+    values = normalize_classification_labels(values)
     if values.ndim != 1 or not 1 <= len(values) <= _MAX_ROWS:
         raise TaskDirectoryError("Classification labels must be a non-empty one-dimensional array")
     return np.asarray([_scalar(value) for value in values], dtype=object)
@@ -428,6 +437,37 @@ def _column_kinds(columns: list[str], values: dict[str, list], info: dict) -> di
         return dict(declared)
     return {name: ("numeric" if _numeric_values(values[name]) is not None else
                    "text" if _is_text_column(name, values[name]) else "categorical") for name in columns}
+
+
+def _configure_npy_columns(values, widths, reader, columns, info):
+    """Infer a two-dimensional NPY schema from the complete training partition."""
+    from .input_readers import _set_text
+
+    if values.ndim != 2 or not 1 <= values.shape[1] <= 4096:
+        raise TaskDirectoryError("Table and text inputs must be non-empty and two-dimensional")
+    prefixes = reader["feature_prefixes"]
+    families = list(zip(prefixes, widths, strict=True))
+    if columns is None:
+        columns = [f"{prefix}_{index}" for prefix, width in families for index in range(width)]
+    if len(columns) != values.shape[1]:
+        raise TaskDirectoryError("NPY columns do not match the feature width")
+
+    kinds = _column_kinds(columns, {name: list(values[:, i]) for i, name in enumerate(columns)}, info)
+    if "feature_types" not in info:
+        forced = {"n": "numeric", "c": "categorical"}
+        column_prefixes = [prefix for prefix, width in families for _ in range(width)]
+        kinds.update({name: forced[prefix] for name, prefix in zip(columns, column_prefixes, strict=True)
+                      if prefix in forced})
+    reader.update(output_kind="table", feature_columns=columns, feature_types=kinds)
+
+    implicit_text = False
+    if len(columns) == 1 and prefixes[0] not in {"n", "c"}:
+        text_types = (str, bytes, np.str_, np.bytes_)
+        column = values[:, 0]
+        implicit_text = (any(isinstance(value, text_types) for value in column)
+                         and all(isinstance(value, text_types) or _missing_content(value) for value in column))
+    if prefixes == ["text"] or implicit_text or all(kind == "text" for kind in kinds.values()):
+        _set_text(reader, columns)
 
 
 def _csv_sample_rows(header: list[str], rows: list[list[str]], reader: dict, source: str, split: str,
@@ -781,7 +821,7 @@ def discover_task_directory(
             valid_index = _csv_sample_rows(valid_header, valid_rows, reader, split_files["validation"]["csv_path"], "validation", valid_positions)
     else:
         train_X, widths = _read_npy_matrix(root, split_files["train"]["feature_paths"])
-        train_y = read_npy_array(_source_file(root, split_files["train"]["labels_path"]))
+        train_y = normalize_classification_labels(read_npy_array(_source_file(root, split_files["train"]["labels_path"])))
         train_index = _array_sample_rows(len(train_y), split_files["train"], "train")
         if not 1 <= len(train_X) <= _MAX_ROWS:
             raise TaskDirectoryError("Training features are empty or exceed the row limit")
@@ -794,27 +834,8 @@ def discover_task_directory(
         else:
             if train_X.ndim == 1:
                 train_X = train_X.reshape(-1, 1)
-            if train_X.ndim != 2 or not 1 <= train_X.shape[1] <= 4096:
-                raise TaskDirectoryError("Table and text inputs must be non-empty and two-dimensional")
-            columns = _declared_columns(info, readme, train_X.shape[1])
-            if columns is None:
-                columns = [f"{prefix}_{index}" for prefix, width in zip(reader["feature_prefixes"], widths, strict=True)
-                           for index in range(width)]
-            forced_kinds = ["numeric" if prefix == "n" else "categorical" if prefix == "c" else None
-                            for prefix, width in zip(reader["feature_prefixes"], widths, strict=True) for _ in range(width)]
-            kinds = _column_kinds(columns, {name: list(train_X[:, i]) for i, name in enumerate(columns)}, info)
-            if "feature_types" not in info:
-                kinds.update({name: forced for name, forced in zip(columns, forced_kinds, strict=True) if forced})
-            reader.update(feature_columns=columns, feature_types=kinds)
-            implicit_text = (len(columns) == 1 and reader["feature_prefixes"][0] not in {"n", "c"}
-                             and any(isinstance(value, (str, bytes, np.str_, np.bytes_)) for value in train_X[:, 0])
-                             and all(isinstance(value, (str, bytes, np.str_, np.bytes_)) or _missing_content(value)
-                                     for value in train_X[:, 0]))
-            if (reader["feature_prefixes"] == ["text"] or implicit_text
-                    or all(kind == "text" for kind in kinds.values())):
-                reader.update(output_kind="text", feature_types=dict.fromkeys(columns, "text"),
-                              modality={"kind": "text", "text_columns": columns,
-                                                            "max_characters": _MAX_FIELD_CHARACTERS})
+            columns = _declared_columns(info, readme, train_X.shape[1]) if train_X.ndim == 2 else None
+            _configure_npy_columns(train_X, widths, reader, columns, info)
             train_X, train_y, train_index = _filter_array_samples(train_X, train_y, train_index, reader, "train")
         train_X = _npy_features(train_X, reader)
         train_y = _labels(train_y)

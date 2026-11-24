@@ -51,7 +51,7 @@ def _json(text):
     return value
 
 
-def _request(gateway, stage, payload, instruction, validate, audit_dir):
+def _request(gateway, stage, payload, instruction, validate, audit_dir, *, max_attempts=2):
     output_contract = (
         "Optional fields may be omitted; return a preprocessing suggestion and optional findings. "
         if stage == "quality" else
@@ -59,7 +59,7 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
         if stage == "layout" else
         "No extra fields. output_schema describes the required fields, not literal placeholder values to copy. "
     )
-    messages = [
+    initial_messages = [
         {"role": "system", "content": (
             "You are a classification data-analysis component. Return one complete, compact JSON object only: "
             "no prose, Markdown fences, or comments. " + output_contract +
@@ -70,7 +70,9 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
         )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
-    for attempt in range(2):
+    messages = initial_messages
+    for attempt in range(max_attempts):
+        last_attempt = attempt + 1 == max_attempts
         previous_text = None
         if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > 15000:
             raise AnalysisError(
@@ -86,7 +88,7 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
                 audit_dir / f"{stage}_invalid_{attempt}.json",
                 {"stage": stage, "error_code": exc.code},
             )
-            if attempt or not gateway.recover_empty_reply():
+            if last_attempt or not gateway.recover_empty_reply():
                 raise EmptyAnalysisReply(f"{stage} returned no usable JSON text") from exc
             correction = "The previous reply contained no usable text. Return only the complete JSON object."
         else:
@@ -100,8 +102,8 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
                     audit_dir / f"{stage}_invalid_{attempt}.json",
                     {"stage": stage, "error": detail},
                 )
-                if attempt:
-                    raise AnalysisError(f"{stage} output failed validation twice") from exc
+                if last_attempt:
+                    raise AnalysisError(f"{stage} output failed validation after {max_attempts} attempts: {detail}") from exc
                 if stage == "quality":
                     correction = (
                         'Return a JSON object such as {"preprocessing":{"numeric_imputation":"median"}}. '
@@ -124,6 +126,9 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir):
             else:
                 _write(audit_dir / f"{stage}.json", result)
                 return result
+        # A correction requests a complete plan, so only the latest failed
+        # reply and error are needed alongside the original evidence.
+        messages = initial_messages.copy()
         _append_correction(messages, previous_text, correction)
 
 
@@ -249,9 +254,24 @@ def _evidence(value, documents):
 
 
 def _path_evidence_matches(path, quote, role):
-    """Accept literal paths or a documented split wildcard, never invented quotes."""
+    """Accept literal, same-row directory/file table, or documented split paths."""
     if path in quote:
         return True
+    source = PurePosixPath(path)
+    parent = source.parent.as_posix()
+    if parent != ".":
+        # A Markdown table may document `folder/` and `file.npy` in different
+        # cells. Both must occur as exact code spans in the SAME table row.
+        # Never combine a folder from one row with filenames in another row.
+        for line in quote.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [re.findall(r"`([^`]+)`", cell) for cell in line.split("|")[1:-1]]
+            for index, tokens in enumerate(cells):
+                if (parent + "/" in tokens or parent in tokens) and any(
+                    source.name in names for j, names in enumerate(cells) if j != index
+                ):
+                    return True
     aliases = {"train": {"train"}, "validation": {"val", "valid", "validation"}, "test": {"test"}}
     tokens = re.findall(r"[A-Za-z0-9_./?*\[\]-]+\.[A-Za-z0-9]+", quote)
     for token in tokens:
@@ -267,6 +287,8 @@ def _path_evidence_matches(path, quote, role):
 
 def _normalize_layout(value):
     """Convert semantic file descriptions into the existing B reader contract."""
+    from .shards import partition_shards
+
     defaults = {"feature_prefixes": [], "target_column": None, "id_columns": [],
                 "feature_columns": [], "feature_types": {}, "reader_options": {},
                 "evidence": [], "unresolved_questions": []}
@@ -285,12 +307,16 @@ def _normalize_layout(value):
         if part is not None:
             if not isinstance(part, dict):
                 raise AnalysisError("Each partition must describe features and optional labels")
-            features = part.get("features")
-            part = {"features": [features] if isinstance(features, str) else features,
-                    "labels": part.get("labels")}
+            items = []
+            for item in partition_shards(part):
+                features = item.get("features")
+                items.append({"features": [features] if isinstance(features, str) else features,
+                              "labels": item.get("labels")})
+            part = {"shards": items} if "shards" in part else items[0]
         result["partitions"][role] = part
     train = result["partitions"]["train"]
-    sources = train.get("features") if train else None
+    first = partition_shards(train)[0] if train else {}
+    sources = first.get("features")
     if not isinstance(sources, list) or not sources or any(not isinstance(path, str) for path in sources):
         raise AnalysisError("Identify the training feature file or class directory")
     if Path(sources[0]).suffix.lower() == ".jsonl":
@@ -298,7 +324,7 @@ def _normalize_layout(value):
     if "format" not in result:
         suffix = Path(sources[0]).suffix.lower()
         result["format"] = {".npy": "npy", ".csv": "csv", ".tsv": "tsv"}.get(
-            suffix, "text_lines" if suffix == ".txt" and train.get("labels") else "auto")
+            suffix, "text_lines" if suffix == ".txt" and first.get("labels") else "auto")
     if "column_mapping" in value:
         result["column_mapping"] = value["column_mapping"]
     kinds = result["feature_types"]
@@ -341,9 +367,10 @@ def _normalize_layout(value):
         order = [prefixes.index("n"), prefixes.index("c")]
         for part in result["partitions"].values():
             if part is not None:
-                if not isinstance(part["features"], list) or len(part["features"]) != 2:
-                    raise AnalysisError("Every NPY partition must have the same feature file count and order")
-                part["features"] = [part["features"][index] for index in order]
+                for item in partition_shards(part):
+                    if not isinstance(item["features"], list) or len(item["features"]) != 2:
+                        raise AnalysisError("Every NPY shard must have the same feature file count and order")
+                    item["features"] = [item["features"][index] for index in order]
         result["feature_prefixes"] = ["n", "c"]
     return result
 
@@ -355,6 +382,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         select_reader,
         validate_options,
     )
+    from .shards import partition_shards
 
     root = Path(task_dir).resolve(strict=True)
     if not root.is_dir():
@@ -375,6 +403,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         "evidence": [{"field": "train", "document": "relative document path", "quote": "exact original quote"}],
         "unresolved_questions": [],
         "column_mapping": {},
+        "row_shards_schema": {"shards": [{"features": ["relative feature path"], "labels": None}]},
     }
     def validate(value):
         value = _normalize_layout(value)
@@ -412,35 +441,36 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         for role, part in parts.items():
             if part is None:
                 continue
-            if not isinstance(part, dict) or set(part) != {"features", "labels"}:
-                raise AnalysisError("A partition must contain features and labels")
-            paths = part["features"]
-            width = len(prefixes) if fmt == "npy" else 1
-            if not isinstance(paths, list) or len(paths) != width:
-                raise AnalysisError("The partition feature file count is incorrect")
-            if fmt in {"csv", "tsv", "image_csv", "convert"} and (part["labels"] is not None or not isinstance(value["target_column"], str) or not value["target_column"].strip()):
-                raise AnalysisError("CSV labels must be embedded in a column, with the labels path set to null")
-            if fmt in {"npy", "text_lines"}:
-                paths = [*paths, part["labels"]]
-            elif part["labels"] is not None:
-                raise AnalysisError("This reader derives labels from records or class directories")
-            for path in paths:
-                try:
-                    _safe_relative(path, files)
-                except AnalysisError as exc:
-                    raise AnalysisError(
-                        f"partitions.{role}: invalid source {json.dumps(path, ensure_ascii=False)}. "
-                        "Copy an exact visible relative path from files, not a wildcard or placeholder. "
-                        "NPY and text_lines require a non-null labels file path."
-                    ) from exc
-                suffix = Path(path).suffix.lower()
-                expected = ".csv" if fmt == "image_csv" else ".txt" if fmt == "text_lines" else "." + fmt
-                if (fmt not in {"text_directory", "image_directory", "convert", "auto"} and suffix != expected) or path in used:
-                    raise AnalysisError("Partition files have an invalid format, duplicate paths, or overlapping roles")
-                used.add(path)
-                quotes = [item["quote"] for item in evidence if item["field"] == role]
-                if not any(_path_evidence_matches(path, quote, role) for quote in quotes):
-                    raise AnalysisError(f"{role} requires a document quote with the relative path")
+            for shard in partition_shards(part):
+                if not isinstance(shard, dict) or set(shard) != {"features", "labels"}:
+                    raise AnalysisError("A partition must contain features and labels")
+                paths = shard["features"]
+                width = len(prefixes) if fmt == "npy" else 1
+                if not isinstance(paths, list) or len(paths) != width:
+                    raise AnalysisError("The partition feature file count is incorrect")
+                if fmt in {"csv", "tsv", "image_csv", "convert"} and (shard["labels"] is not None or not isinstance(value["target_column"], str) or not value["target_column"].strip()):
+                    raise AnalysisError("CSV labels must be embedded in a column, with the labels path set to null")
+                if fmt in {"npy", "text_lines"}:
+                    paths = [*paths, shard["labels"]]
+                elif shard["labels"] is not None:
+                    raise AnalysisError("This reader derives labels from records or class directories")
+                for path in paths:
+                    try:
+                        _safe_relative(path, files)
+                    except AnalysisError as exc:
+                        raise AnalysisError(
+                            f"partitions.{role}: invalid source {json.dumps(path, ensure_ascii=False)}. "
+                            "Copy an exact visible relative path from files, not a wildcard or placeholder. "
+                            "NPY and text_lines require a non-null labels file path."
+                        ) from exc
+                    suffix = Path(path).suffix.lower()
+                    expected = ".csv" if fmt == "image_csv" else ".txt" if fmt == "text_lines" else "." + fmt
+                    if (fmt not in {"text_directory", "image_directory", "convert", "auto"} and suffix != expected) or path in used:
+                        raise AnalysisError("Partition files have an invalid format, duplicate paths, or overlapping roles")
+                    used.add(path)
+                    quotes = [item["quote"] for item in evidence if item["field"] == role]
+                    if not any(_path_evidence_matches(path, quote, role) for quote in quotes):
+                        raise AnalysisError(f"{role} requires a document quote with the relative path")
         for key in ("feature_columns", "id_columns"):
             if not isinstance(value[key], list) or len(value[key]) > 4096 or any(not isinstance(n, str) or not n.strip() for n in value[key]) or len(set(value[key])) != len(value[key]):
                 raise AnalysisError("The column name list is invalid")
@@ -463,7 +493,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         elif value["reader_options"]:
             raise AnalysisError(f"reader_options for format={fmt!r} must be {{}}; remove all keys. "
                                 "NumPy loading arguments are fixed by the program.")
-        if fmt in FORMATS:
+        if fmt in FORMATS or any(part is not None and "shards" in part for part in value["partitions"].values()):
             additional_contract(root, {}, {}, {"external_reader": _external_layout(value)})
         return value
     value = _request(gateway, "layout", {"files": files, "documents": documents, "output_schema": schema,
@@ -472,7 +502,14 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                      "Required: partitions.train with actual feature/label paths, "
                      "the documented metric, and evidence. Other fields may be omitted. "
                      "All paths must exactly match files, with forward slashes; no invented paths or glob paths. "
+                     "Evidence may quote a Markdown table row listing a directory and filenames in separate cells; "
+                     "return the joined actual relative path, but preserve the original table row verbatim in quote. "
                      "Preserve supplied validation/test splits; omit absent splits or use null. "
+                     'For row-sharded CSV/TSV/flat records, NPY or text_lines, use a partition object '
+                     '{"shards":[{"features":["exact path"],"labels":null}, ...]} in documented row order. '
+                     "Each NPY/text shard needs its own labels file. Do not put row shards into features: "
+                     "multiple features denote numeric/categorical COLUMN blocks within one shard. "
+                     "Cite every shard path with the corresponding partition evidence; do not merge different splits. "
                      "NPY: provide separate .npy labels. Optional feature_kinds describes each feature file "
                      "in matching order as numeric, categorical, text, or image; omit when unknown. "
                      "For two NPY arrays identify which is numeric and which is categorical. "
@@ -490,10 +527,11 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                      "Cite each partition's paths (field=train/validation/test), target_column for record labels, and metric. "
                      "A documented split wildcard such as C_*.npy is allowed in quotes only; keep its original text. "
                      "metric is accuracy/f1_macro/log_loss, supported by the quote; never guess missing task facts.",
-                     validate, audit)
+                     validate, audit, max_attempts=4)
     inventory = {}
+    sharded = any(part is not None and "shards" in part for part in value["partitions"].values())
     for role, part in value["partitions"].items():
-        if part is None:
+        if part is None or sharded:
             continue
         if value["format"] == "csv":
             inventory[f"{role}.csv"] = part["features"][0]
@@ -509,7 +547,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
     if value["feature_types"]:
         metadata["feature_types"] = value["feature_types"]
     result = {"inventory": inventory, "documents": documents, "metadata": metadata, "layout": value}
-    if value["format"] in FORMATS:
+    if value["format"] in FORMATS or sharded:
         result["external_reader"] = _external_layout(value)
     return result
 
@@ -518,26 +556,15 @@ def _external_layout(value):
     return {"format": value["format"], "options": value.get("reader_options", {}),
             "partitions": value["partitions"], "target_column": value["target_column"],
             "id_columns": value["id_columns"], "feature_columns": value["feature_columns"],
-            "feature_types": value["feature_types"]}
+            "feature_types": value["feature_types"], "feature_prefixes": value["feature_prefixes"]}
 
 
-def review_quality(task_spec, gateway, audit_dir, documents):
-    from .prepare import _load_partition
-    from .profiling import modality_profile, table_profile
+def review_quality(task_spec, gateway, audit_dir, documents, *, training_data=None):
+    from .prepare import load_training_data
+
     spec = copy.deepcopy(task_spec)
-    root = Path(spec["source_root"])
-    if spec["schema_version"] == "1.0":
-        frame, _, _, _ = _load_partition(root, "train", spec, spec["feature_columns"], spec["feature_types"])
-        # Decoded image pixels are complete numeric values, not candidates for
-        # LLM imputation. Keep their thousands of internal columns out of prompts.
-        reviewed_types = {name: kind for name, kind in spec["feature_types"].items()
-                          if not re.fullmatch(r"__image_pixel_\d+", name)}
-        facts = table_profile(frame[list(reviewed_types)], reviewed_types)
-    else:
-        from .prepare_modalities import _load_split
-        values, _, _, _ = _load_split(root, spec, "train")
-        facts = modality_profile(values, spec["modality"])
-        reviewed_types = {}
+    training = training_data if training_data is not None else load_training_data(spec)
+    facts, reviewed_types = training.quality_profile()
     _write(Path(audit_dir) / "training_statistics.json", facts)
     bounded = copy.deepcopy(facts)
     bounded["column_statistics"] = bounded.get("column_statistics", [])[:32]

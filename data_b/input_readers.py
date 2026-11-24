@@ -17,12 +17,13 @@ import numpy as np
 
 from .task_directory import TaskDirectoryError
 
-FORMATS = {"tsv", "text_lines", "text_directory", "image_directory", "image_csv", "convert"}
+FORMATS = {"tsv", "text_lines", "text_directory", "image_directory", "image_csv", "convert", "shards"}
 READER_OPTION_FIELDS = {
     "tsv": set(), "text_lines": set(), "text_directory": set(),
     "image_directory": set(),
     "image_csv": {"image_column", "image_base", "auxiliary_types"},
     "convert": {"source_format", "field_paths", "delimiter"},
+    "shards": set(),
 }
 MAX_BYTES = 64 * 1024 * 1024
 MAX_ROWS = 100_000
@@ -43,7 +44,8 @@ def select_reader(root, layout):
     """
     result = copy.deepcopy(layout)
     fmt = result["format"]
-    source = result["partitions"]["train"]["features"][0]
+    from .shards import partition_shards
+    source = partition_shards(result["partitions"]["train"])[0]["features"][0]
     mapping = result.pop("column_mapping", {})
     if not isinstance(mapping, dict) or any(not isinstance(key, str) or not isinstance(value, str)
                                            for key, value in mapping.items()):
@@ -313,6 +315,9 @@ def read_split(root, files, reader, split, touch, *, fit=False, prediction=False
     """Read only an explicitly selected split; touch hashes every actual input."""
     from . import task_directory as td
 
+    if reader["format"] == "shards":
+        from .shards import read_shards
+        return read_shards(root, files, reader, split, touch, fit=fit, prediction=prediction)
     fmt, options = reader["format"], reader["options"]
     paths = files["feature_paths"]
     if len(paths) != 1:
@@ -487,7 +492,7 @@ def _records_to_arrays(records, reader, source, split, *, fit, prediction=False,
 
 
 def reader_hash():
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("shards.py").read_bytes()).hexdigest()
 
 
 def normalize_prediction_input(rules_path, root, relative, destination):
@@ -519,13 +524,17 @@ def normalize_prediction_input(rules_path, root, relative, destination):
 
 def additional_contract(root, inventory, info, resolution=None, *, allow_auto=True):
     """Resolve added formats from a validated LLM plan, info.json, or conventions."""
+    from .shards import automatic_contract, build_contract
+
     if resolution is not None and resolution.get("external_reader"):
         contract = resolution["external_reader"]
     elif info.get("reader_format"):
         contract = {"format": info["reader_format"], "options": info.get("reader_options", {}),
                     "partitions": info.get("partitions"), "target_column": info.get("target_column"),
                     "id_columns": info.get("id_columns", []), "feature_columns": info.get("feature_columns", []),
-                    "feature_types": info.get("feature_types", {})}
+                    "feature_types": info.get("feature_types", {}), "feature_prefixes": info.get("feature_prefixes", ["x"])}
+    elif (sharded := automatic_contract(inventory, info)) is not None:
+        contract = sharded
     elif allow_auto:
         from .task_directory import _pick_split_files
         candidates = [(fmt, _pick_split_files(inventory, fmt)) for fmt in ("tsv",)]
@@ -541,6 +550,11 @@ def additional_contract(root, inventory, info, resolution=None, *, allow_auto=Tr
             "feature_columns": info.get("feature_columns", []), "feature_types": info.get("feature_types", {})}
     else:
         return None
+    parts = contract.get("partitions")
+    if parts is not None and not isinstance(parts, dict):
+        raise InputReaderError("Reader partitions must be an object")
+    if any(isinstance(part, dict) and "shards" in part for part in (parts or {}).values()):
+        return build_contract(contract)
     fmt = contract["format"]
     options = validate_options(fmt, contract.get("options", {}))
     parts = contract.get("partitions")

@@ -6,17 +6,20 @@ import csv
 import hashlib
 import json
 import re
+from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from evaluation_d.metric_contracts import validate_metric_spec
 
-from .npy_reader import read_npy_array
+from .npy_reader import normalize_classification_labels, read_npy_array
 from .preprocessing import TablePreprocessor, validate_preprocessing
-from .profiling import table_profile
+from .profiling import modality_profile, table_profile
 from .raw_reader import load_feature_frame, typed_category_token
 from .sample_index import load_sample_index, save_combined_index
 
@@ -173,7 +176,7 @@ def _load_partition(
     label_path, label_relative = _source_file(root, part["labels_path"])
     feature_hash_before, label_hash_before = _sha256(feature_path), _sha256(label_path)
     frame = load_feature_frame(feature_path, columns, kinds)
-    labels = read_npy_array(label_path)
+    labels = normalize_classification_labels(read_npy_array(label_path))
     if labels.ndim != 1 or len(labels) != part["n_samples"] or len(frame) != part["n_samples"]:
         raise ValueError(f"{name} features or labels do not match n_samples")
     feature_hash_after, label_hash_after = _sha256(feature_path), _sha256(label_path)
@@ -187,6 +190,61 @@ def _load_partition(
     hashes.update(sample_hash)
     frame.index = [row["sample_id"] for row in sample_rows]
     return frame, labels, hashes, sample_rows
+
+
+@dataclass
+class TrainingData:
+    """One validated training partition and its statistics for the current B run."""
+
+    features: pd.DataFrame | np.ndarray
+    labels: np.ndarray
+    hashes: dict
+    index: list[dict]
+    source_root: Path
+    input_spec: bytes
+    feature_types: dict[str, str]
+    modality: dict | None
+    _column_statistics: dict = field(default_factory=dict, init=False)
+
+    @cached_property
+    def profile(self) -> dict:
+        if self.modality is not None:
+            return modality_profile(self.features, self.modality)
+        return table_profile(self.features, self.feature_types, column_cache=self._column_statistics)
+
+    def quality_profile(self) -> tuple[dict, dict[str, str]]:
+        # Preserve the LLM view without pixel columns. The full package still
+        # includes them and reuses the column statistics already computed here.
+        reviewed = {name: kind for name, kind in self.feature_types.items()
+                    if not re.fullmatch(r"__image_pixel_\d+", name)}
+        if len(reviewed) == len(self.feature_types):
+            return self.profile, reviewed
+        frame = self.features[list(reviewed)]
+        return table_profile(frame, reviewed, column_cache=self._column_statistics), reviewed
+
+
+def load_training_data(spec: dict[str, Any], *, reuse: TrainingData | None = None) -> TrainingData:
+    # Quality review may change the output version and preprocessing settings.
+    input_spec = _json_bytes({key: value for key, value in spec.items()
+                             if key not in {"data_version", "preprocessing"}})
+    if reuse is not None:
+        if reuse.input_spec != input_spec:
+            raise ValueError("The training partition contract changed after quality review")
+        for entry in reuse.hashes.values():
+            path, _ = _source_file(reuse.source_root, entry["relative_path"])
+            if _sha256(path) != entry["sha256"]:
+                raise ValueError("Training source files changed after quality review")
+        return reuse
+    if spec["schema_version"] == "2.0":
+        from .prepare_modalities import _load_split
+        from .prepare_modalities import _validate_spec as validate_modalities
+
+        root, normalized = validate_modalities(spec)
+        features, labels, hashes, index = _load_split(root, normalized, "train")
+        return TrainingData(features, labels, hashes, index, root, input_spec, {}, normalized["modality"])
+    root, columns, kinds = _validate_spec(spec)
+    features, labels, hashes, index = _load_partition(root, "train", spec, columns, kinds)
+    return TrainingData(features, labels, hashes, index, root, input_spec, kinds, None)
 
 
 def _label_token(value: Any) -> str:
@@ -276,12 +334,14 @@ def _save_ids(path: Path, ids: list[str], values: list[int] | None = None) -> No
             writer.writerow([sample_id] if values is None else [sample_id, values[index]])
 
 
-def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, Any]:
+def prepare_data(
+    task_spec: dict[str, Any], data_root: str | Path, *, training_data: TrainingData | None = None,
+) -> dict[str, Any]:
     """Prepare or reuse an immutable package and return absolute paths for C and D."""
     if isinstance(task_spec, dict) and task_spec.get("schema_version") == "2.0":
         from .prepare_modalities import prepare_modalities
 
-        return prepare_modalities(task_spec, data_root)
+        return prepare_modalities(task_spec, data_root, training_data=training_data)
     fresh_directory: Path | None = None
     try:
         source_root, columns, kinds = _validate_spec(task_spec)
@@ -290,9 +350,8 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
         if not directory.exists():
             directory.mkdir(parents=True, exist_ok=False)
             fresh_directory = directory
-        train_frame, train_raw_labels, train_hashes, train_index = _load_partition(
-            source_root, "train", task_spec, columns, kinds
-        )
+        training = load_training_data(task_spec, reuse=training_data)
+        train_frame, train_raw_labels = training.features, training.labels
         valid_frame, valid_raw_labels, valid_hashes, valid_index = _load_partition(
             source_root, "validation", task_spec, columns, kinds
         )
@@ -317,7 +376,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
 
         y_train = encode(train_raw_labels, "train", require_all_classes=True)
         y_valid = encode(valid_raw_labels, "validation", require_all_classes=False)
-        hashes = {"train": train_hashes, "validation": valid_hashes}
+        hashes = {"train": training.hashes, "validation": valid_hashes}
         signature = _source_signature(task_spec, columns, kinds, hashes)
         if fresh_directory is None:
             result = _read_cache(directory, signature)
@@ -348,7 +407,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
                 "feature_types": {c: kinds[c] for c in columns},
                 "train_label_counts": train_counts,
                 "preprocessing": task_spec.get("preprocessing", {}),
-                **table_profile(train_frame, kinds),
+                **training.profile,
                 "table_encoding": "frequency" if preprocessor.frequency_maps_ else "one_hot",
             }
             _write_json(metadata / "profile.json", profile)
@@ -357,7 +416,7 @@ def prepare_data(task_spec: dict[str, Any], data_root: str | Path) -> dict[str, 
                 payload = json.dumps({"columns": columns, "data": rows}, allow_nan=False)
                 with (directory / name).open("x", encoding="utf-8") as stream:
                     stream.write(payload)
-            save_combined_index(metadata / "sample_index.csv", train_index, valid_index)
+            save_combined_index(metadata / "sample_index.csv", training.index, valid_index)
             _save_array(directory / "X_train.npy", X_train)
             _save_array(directory / "y_train.npy", y_train)
             _save_array(directory / "X_valid.npy", X_valid)

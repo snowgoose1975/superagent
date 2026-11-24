@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from agent_a.controller import PackageAController, SchoolAController
 from agent_a.search_config import load_search_config
-from data_b.prepare import prepare_data
+from data_b.prepare import load_training_data, prepare_data
 from evaluation_d.evaluate import evaluate, evaluate_training_majority_baseline
 from evaluation_d.final_test import FinalTestError, evaluate_frozen_bundle, format_test_result
 from evaluation_d.logger import append_session_event
@@ -570,6 +570,7 @@ def run_project(
         "b_analysis": b_analysis,
     }
     prepared: dict[str, Any] | None = None
+    training_data = None
     task_context: dict[str, Any] = {}
     stage = "task_discovery" if task_directory is not None else "preparation"
     log_event(
@@ -642,7 +643,9 @@ def run_project(
                     raise ValueError("These training inputs already have a different task budget ledger")
                 summary["budget_fingerprint"] = report["budget_fingerprint"]
                 try:
-                    spec, quality = review_quality(spec, gateway, session_dir / "b_analysis", resolution["documents"])
+                    training_data = load_training_data(spec)
+                    spec, quality = review_quality(spec, gateway, session_dir / "b_analysis", resolution["documents"],
+                                                   training_data=training_data)
                 except EmptyAnalysisReply:
                     if not gateway.recover_empty_reply():
                         raise
@@ -698,7 +701,8 @@ def run_project(
         stage = "preparation"
         log_event("data_preparation_started", stage="preparation", status="started")
         print("[B] Preparing train and validation data.", flush=True)
-        prepared = prepare_data(spec, root / "data" / "prepared")
+        prepared = prepare_data(spec, root / "data" / "prepared", training_data=training_data)
+        training_data = None
         summary["budget_fingerprint"] = (
             discovered["discovery_report"]["budget_fingerprint"] if task_directory is not None
             else _prepared_budget_fingerprint(prepared)
