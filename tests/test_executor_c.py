@@ -1,4 +1,4 @@
-"""真实训练和边界行为验证；全部数据由本文件模拟，不使用真实任务测试集。"""
+"""Exercise real training and runner contracts with synthetic data."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def read_result(root: Path, relative: str):
 
 
 def rewrite_json(path: Path, value: dict):
-    # 仅修改本测试新建的模拟输入，用于验证拒绝行为；不修改历史运行。
+    # Modify only the synthetic inputs from this test to validate rejection.
     path.write_text(json.dumps(value, allow_nan=False), encoding="utf-8")
 
 
@@ -82,13 +82,15 @@ def test_real_training_reload_and_d_handoff(tmp_path, model, n_classes):
     assert (result_path.parent / "model_registry.snapshot.py").is_file()
     assert (result_path.parent / "model_factory.snapshot.py").is_file()
     assert (result_path.parent / "diagnostics.snapshot.py").is_file()
+    assert (result_path.parent / "capabilities.snapshot.json").is_file()
+    assert (result_path.parent / "npy_reader.snapshot.py").is_file()
     diagnostics = read_json(result_path.parent / "diagnostics.json")
     assert diagnostics["status"] == "success"
     assert diagnostics["experiment_id"] == plan["experiment_id"]
     assert diagnostics["random_seed"] == plan["random_seed"]
     assert diagnostics["input_shape"]["validation"][0] == 30
     assert diagnostics["timings_seconds"]["total"] >= diagnostics["timings_seconds"]["fit"]
-    assert "训练完成" in (result_path.parent / "stdout.log").read_text(encoding="utf-8")
+    assert "Training complete" in (result_path.parent / "stdout.log").read_text(encoding="utf-8")
 
     returned_result, rows = load_successful_predictions(result_ref, root)
     assert returned_result == result
@@ -96,7 +98,7 @@ def test_real_training_reload_and_d_handoff(tmp_path, model, n_classes):
     assert list(rows[0]) == ["sample_id", "y_pred", *[f"p_{i}" for i in range(n_classes)]]
     assert rows[0]["sample_id"] == "valid_000001"
 
-    # 用全新 Python 进程导入 sklearn 并加载，避免“仅原内存中的模型可用”。
+    # Check sklearn import and model loading in a fresh process.
     script = (
         "import json,sys,joblib,numpy as np; "
         "m=joblib.load(sys.argv[1]); X=np.load(sys.argv[2],allow_pickle=False); "
@@ -214,6 +216,21 @@ def test_bad_b_data_is_rejected(tmp_path, case):
     assert result["status"] == "rejected", result
     assert result["error"]["code"] == "DATA_INVALID", result
     assert result["artifacts"]["model_path"] is None
+
+
+def test_prepared_size_limit_applies_before_hashing(tmp_path, monkeypatch):
+    from executor_c import contracts
+
+    manifest_path = create_data(tmp_path)
+    with (manifest_path.parent / "X_train.npy").open("r+b") as stream:
+        stream.truncate(512 * 1024 * 1024)
+
+    def reject_hash(*_args, **_kwargs):
+        pytest.fail("An oversized input must be rejected before hashing")
+
+    monkeypatch.setattr(contracts, "sha256_file", reject_hash)
+    with pytest.raises(ContractError, match="Could not read"):
+        load_prepared_data(manifest_path, validate_plan(plan_for(manifest_path)))
 
 
 def test_training_inputs_do_not_read_evaluation_labels(tmp_path, monkeypatch):

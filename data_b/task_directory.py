@@ -60,13 +60,19 @@ def _keep_present_samples(reader: dict, split: str, sample_rows: list[dict], rea
         "reason_counts": counts, "dropped_samples": dropped,
         "details_truncated": n_dropped > 1000,
     }
+    if split == "test" and n_dropped:
+        details = ", ".join(f"{reason}: {count}" for reason, count in sorted(counts.items())[:8])
+        raise TaskDirectoryError(
+            f"Final test requires all {len(sample_rows)} rows. "
+            f"{n_dropped} rows have missing required content ({details})"
+        )
     if not kept:
         raise TaskDirectoryError(f"No usable {split} samples remain after removing missing text/images")
     return kept
 
 
 def _filter_array_samples(values, labels, sample_rows, reader, split):
-    if len(values) != len(labels) or len(values) != len(sample_rows):
+    if len(values) != len(sample_rows) or (labels is not None and len(values) != len(labels)):
         raise TaskDirectoryError("Features, labels and sample IDs have different row counts")
     if reader["output_kind"] == "image":
         if values.dtype.kind in "biu":
@@ -77,7 +83,11 @@ def _filter_array_samples(values, labels, sample_rows, reader, split):
         else:
             reasons = [["missing_image"] if all(_missing_content(value) for value in image.flat) else [] for image in values]
     else:
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
         columns = reader["feature_columns"]
+        if values.ndim != 2 or values.shape[1] != len(columns):
+            raise TaskDirectoryError("Feature width does not match the training schema")
         kinds = reader["feature_types"]
         text_indices = [(index, name) for index, name in enumerate(columns) if kinds[name] == "text"]
         reasons = [[f"missing_text:{name}" for index, name in text_indices if _missing_content(row[index])]
@@ -85,7 +95,7 @@ def _filter_array_samples(values, labels, sample_rows, reader, split):
     kept = _keep_present_samples(reader, split, sample_rows, reasons)
     if len(kept) == len(values):
         return values, labels, sample_rows
-    return values[kept], labels[kept], [sample_rows[index] for index in kept]
+    return values[kept], None if labels is None else labels[kept], [sample_rows[index] for index in kept]
 
 
 def _filter_csv_samples(root, header, rows, reader, source, split):
@@ -207,11 +217,19 @@ def _read_npy_matrix(root: Path, paths: list[str]) -> tuple[np.ndarray, list[int
     return output, widths
 
 
-def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
-    aliases = {"accuracy": "accuracy", "acc": "accuracy", "f1_macro": "f1_macro",
+def _metric(
+    info: dict[str, Any], readme: str, *, declarations_only: bool = False,
+) -> tuple[dict[str, Any], str]:
+    accuracy_zh = "\u51c6\u786e\u7387"
+    log_loss_zh = "\u5bf9\u6570\u635f\u5931"
+    cross_entropy_zh = "\u4ea4\u53c9\u71b5"
+    macro_f1_zh = "\u5b8f"
+    aliases = {accuracy_zh: "accuracy", log_loss_zh: "log_loss", cross_entropy_zh: "log_loss",
+               f"{macro_f1_zh}f1": "f1_macro", f"{macro_f1_zh} f1": "f1_macro",
+               "accuracy": "accuracy", "acc": "accuracy", "f1_macro": "f1_macro",
                "macro_f1": "f1_macro", "macro-f1": "f1_macro", "macro f1": "f1_macro",
                "f1 macro": "f1_macro", "log_loss": "log_loss", "logloss": "log_loss",
-               "log loss": "log_loss", "cross_entropy": "log_loss"}
+               "log loss": "log_loss", "log-loss": "log_loss", "cross_entropy": "log_loss"}
     explicit: Any = None
     for field in ("primary_metric", "metric", "evaluation_metric", "eval_metric"):
         if field in info:
@@ -227,22 +245,26 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
         text = re.sub(r"[*`]", "", readme.lower())
         # A primary declaration outranks later diagnostic metric mentions.  In
         # particular, an unsupported primary AUC cannot silently become accuracy.
-        named_pattern = (r"(?:accuracy|acc|macro[ _-]f1|f1[ _-]macro|"
-                         r"log[ _-]?loss|cross[ _-]entropy)\b")
+        metric_patterns = {
+            "accuracy": rf"(?<![a-z0-9_])(?:accuracy|acc)(?![a-z0-9_])|{accuracy_zh}",
+            "f1_macro": rf"(?<![a-z0-9_])(?:macro[ _-]f1|f1[ _-]macro)(?![a-z0-9_])|{macro_f1_zh}[ _-]*f1",
+            "log_loss": rf"(?<![a-z0-9_])(?:log[ _-]?loss|cross[ _-]entropy)(?![a-z0-9_])|{log_loss_zh}|{cross_entropy_zh}",
+        }
 
         def declared_name(fragment: str) -> str:
             fragment = re.sub(r"^(?:(?:the|test|validation|set)\s+)+", "", fragment.strip())
-            match = re.match(named_pattern, fragment)
-            if not match:
-                raise TaskDirectoryError(f"README declares an unsupported metric: {fragment[:60]!r}")
-            raw = re.sub(r"[ _-]+", " ", match.group(0))
-            normal = {"macro f1": "f1_macro", "f1 macro": "f1_macro",
-                      "log loss": "log_loss", "cross entropy": "log_loss"}
-            return normal.get(raw, aliases.get(raw, raw))
+            fragment = fragment.lstrip('"\'“‘')
+            for name, pattern in metric_patterns.items():
+                if re.match(pattern, fragment):
+                    return name
+            raise TaskDirectoryError(f"README declares an unsupported metric: {fragment[:60]!r}")
 
         primary = re.findall(
             r"\b(?:primary|main)[ _-]+(?:evaluation[ _-]+)?metric\s*(?:is\s+|[:=]\s*)?([^\n.;]+)",
             text)
+        primary.extend(re.findall(
+            r"\u4e3b(?:\u8981)?(?:\u8bc4\u4f30|\u8bc4\u4ef7)?\u6307\u6807"
+            r"\s*(?:\u4e3a|\u662f|[:=\uff1a])?\s*([^\n.;\u3002\uff1b\uff0c]+)", text))
         final = re.findall(
             r"\breport\s+(?:the\s+)?(?:final\s+)?test(?:\s+set)?\s+"
             r"(?:(?:primary\s+)?metrics?\s*[:=]\s*)?([^\n.;]+)", text)
@@ -253,10 +275,10 @@ def _metric(info: dict[str, Any], readme: str) -> tuple[dict[str, Any], str]:
                 raise TaskDirectoryError("README contains conflicting primary metrics")
             name = declared.pop()
             return {"name": name, "greater_is_better": name != "log_loss"}, "README_primary" if primary else "README_test_report"
+        if declarations_only:
+            return {"name": "accuracy", "greater_is_better": True}, "default_unspecified"
         found = set()
-        for pattern, name in ((r"\baccuracy\b", "accuracy"),
-                              (r"\b(?:macro[ _-]f1|f1[ _-]macro)\b", "f1_macro"),
-                              (r"\b(?:log[ _-]?loss|cross[ _-]entropy)\b", "log_loss")):
+        for name, pattern in metric_patterns.items():
             if re.search(pattern, text):
                 found.add(name)
         if len(found) > 1:
@@ -435,8 +457,19 @@ def _column_kinds(columns: list[str], values: dict[str, list], info: dict) -> di
                 or any(kind not in {"numeric", "categorical", "text"} for kind in declared.values())):
             raise TaskDirectoryError("info feature_types must cover all inputs with numeric, categorical, or text")
         return dict(declared)
-    return {name: ("numeric" if _numeric_values(values[name]) is not None else
-                   "text" if _is_text_column(name, values[name]) else "categorical") for name in columns}
+    kinds = {}
+    for name in columns:
+        column = values[name]
+        has_padded_code = any(
+            isinstance(value, str) and re.fullmatch(r"0[0-9]+", value.strip()) for value in column
+        )
+        if not has_padded_code and _numeric_values(column) is not None:
+            kinds[name] = "numeric"
+        elif _is_text_column(name, column):
+            kinds[name] = "text"
+        else:
+            kinds[name] = "categorical"
+    return kinds
 
 
 def _configure_npy_columns(values, widths, reader, columns, info):
@@ -494,14 +527,22 @@ def _array_sample_rows(count: int, files: dict, split: str) -> list[dict]:
             for i in range(count)]
 
 
-def _csv_arrays(header: list[str], rows: list[list[str]], reader: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    expected = [*reader["feature_columns"], reader["target_column"], *reader["id_columns"],
-                *reader.get("ignored_columns", [])]
+def _csv_arrays(
+    header: list[str], rows: list[list[str]], reader: dict[str, Any], *, allow_unlabeled: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    target = reader["target_column"]
+    has_labels = target in header
+    expected = [*reader["feature_columns"], *reader["id_columns"], *reader.get("ignored_columns", [])]
+    if has_labels or not allow_unlabeled:
+        expected.append(target)
     if set(header) != set(expected):
         raise TaskDirectoryError("CSV columns differ from the discovered features, labels, or IDs")
     indices = [header.index(name) for name in reader["feature_columns"]]
     values = np.asarray([[row[index] for index in indices] for row in rows], dtype=object)
-    labels = _labels(np.asarray([row[header.index(reader["target_column"])] for row in rows], dtype=object))
+    labels = None
+    if has_labels:
+        target_index = header.index(target)
+        labels = _labels(np.asarray([row[target_index] for row in rows], dtype=object))
     if reader["output_kind"] == "text":
         return _text_matrix(values), labels
     for column_index, name in enumerate(reader["feature_columns"]):
@@ -517,7 +558,7 @@ def _csv_arrays(header: list[str], rows: list[list[str]], reader: dict[str, Any]
         elif reader["feature_types"][name] == "text":
             values[:, column_index] = raw
         else:
-            values[:, column_index] = [None if value.strip().casefold() in _MISSING else value for value in raw]
+            values[:, column_index] = [None if _missing_content(value) else value for value in raw]
     return values, labels
 
 
@@ -748,11 +789,11 @@ def discover_task_directory(
         label_families = [_pick_split_files(inventory, "npy", f"{prefix}_")
                           for prefix in ("y", "label", "labels", "target")]
         label_families = [files for files in label_families if files]
-        if len(label_families) != 1 or set(label_families[0]) != split_names:
+        if len(label_families) != 1 or not split_names - {"test"} <= set(label_families[0]) <= split_names:
             raise TaskDirectoryError("NPY features require a unique matching y/label split")
         reader = {"format": "npy", "feature_prefixes": prefixes, "output_kind": "table"}
         split_files = {split: {"feature_paths": [feature_families[prefix][split] for prefix in prefixes],
-                               "labels_path": label_families[0][split]}
+                               "labels_path": label_families[0].get(split)}
                        for split in ("train", "validation", "test") if split in split_names}
     # Hash/read train and validation only. No test file stat, header, hash, or values.
     for split in (() if external is not None else ("train", "validation")):
@@ -868,7 +909,7 @@ def discover_task_directory(
     for relative, digest in hashes.items():
         if _sha256(_source_file(root, relative)) != digest:
             raise TaskDirectoryError("Development data or instructions changed during discovery")
-    code_hash = hashlib.sha256((_sha256(Path(__file__)) + reader_hash()).encode()).hexdigest()
+    code_hash = reader_hash()
     train_policy = {"max_trials": max_trials, "random_seed": random_seed,
                     "timeout_seconds": timeout_seconds}
     identity = {"sources": hashes, "reader": reader, "metric": metric, "split_strategy": split_strategy,
@@ -912,7 +953,10 @@ def discover_task_directory(
         descriptor = {"schema_version": "2.0", "kind": "task_directory", "task_id": task_id,
                       "source_root": str(root), "reader": reader,
                       "test_files": split_files["test"], "n_samples": declared_test_size,
-                      "primary_metric": metric, "reader_code_sha256": code_hash}
+                      "primary_metric": metric, "reader_code_sha256": code_hash,
+                      "development_files": sorted({
+                          _source_file(root, name).relative_to(root).as_posix() for name in hashes
+                      })}
         descriptor_path = destination / "test_descriptor.json"
         _write_json(descriptor_path, descriptor)
     paragraphs = [
@@ -953,6 +997,7 @@ def discover_task_directory(
               "n_source_train": n_source_train, "validation_split": split_strategy,
               "sample_filtering": reader.get("sample_filtering", {}),
               "test_read_during_discovery": False, "test_files": split_files.get("test"),
+              "validation_files": split_files.get("validation"),
               "overlapping_partition_ids": len({r["sample_id"] for r in train_index}
                                                & {r["sample_id"] for r in valid_index}),
               "dropped_id_columns": reader.get("id_columns", []),
@@ -978,7 +1023,7 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
         raise TaskDirectoryError("Unsupported automatic test descriptor")
     from .input_readers import FORMATS, read_split, reader_hash
 
-    code_hash = hashlib.sha256((_sha256(Path(__file__)) + reader_hash()).encode()).hexdigest()
+    code_hash = reader_hash()
     if descriptor.get("reader_code_sha256") != code_hash:
         raise TaskDirectoryError("Task reader changed. Preserve the old descriptor and rediscover the task")
     root = Path(descriptor["source_root"]).expanduser().resolve(strict=True)
@@ -989,57 +1034,71 @@ def materialize_final_test(descriptor_path: Path, output_dir: Path) -> Path:
         raise TaskDirectoryError("Final test staging must be outside the task directory")
     reader, files = descriptor["reader"], descriptor["test_files"]
     before = {}
+    development_files = set(descriptor["development_files"])
+
+    def test_source_path(relative):
+        path = _source_file(root, relative)
+        if path.relative_to(root).as_posix() in development_files:
+            raise TaskDirectoryError("Final test reuses a development input file")
+        return path
+
     if reader.get("format") in FORMATS:
         def touch(relative):
-            digest = _sha256(_source_file(root, relative))
+            digest = _sha256(test_source_path(relative))
             if relative in before and before[relative] != digest:
                 raise TaskDirectoryError("Test input changed during reading")
             before[relative] = digest
 
-        X, y, sample_rows = read_split(root, files, reader, "test", touch)
+        X, y, sample_rows = read_split(root, files, reader, "test", touch, prediction=None)
         relatives = list(before)
     elif reader.get("format") == "csv":
         relatives = [files["csv_path"]]
     elif reader.get("format") == "npy":
-        relatives = [*files["feature_paths"], files["labels_path"]]
+        relatives = [*files["feature_paths"]]
+        if files.get("labels_path") is not None:
+            relatives.append(files["labels_path"])
     else:
         raise TaskDirectoryError("Unsupported test descriptor reader")
     if reader.get("format") not in FORMATS:
-        before = {name: _sha256(_source_file(root, name)) for name in relatives}
+        before = {name: _sha256(test_source_path(name)) for name in relatives}
     if reader["format"] == "csv":
         header, rows = _read_csv(_source_file(root, files["csv_path"]))
         rows, source_rows = _filter_csv_samples(root, header, rows, reader, files["csv_path"], "test")
-        X, y = _csv_arrays(header, rows, reader)
+        X, y = _csv_arrays(header, rows, reader, allow_unlabeled=True)
         sample_rows = _csv_sample_rows(header, rows, reader, files["csv_path"], "test", source_rows)
     elif reader["format"] == "npy":
         X, _ = _read_npy_matrix(root, files["feature_paths"])
-        y = read_npy_array(_source_file(root, files["labels_path"]))
-        sample_rows = _array_sample_rows(len(y), files, "test")
+        y = (read_npy_array(_source_file(root, files["labels_path"]))
+             if files.get("labels_path") is not None else None)
+        sample_rows = _array_sample_rows(len(X), files, "test")
         X, y, sample_rows = _filter_array_samples(X, y, sample_rows, reader, "test")
         X = _npy_features(X, reader)
-        y = _labels(y)
-    if len(X) != len(y):
+        if y is not None:
+            y = _labels(y)
+    if y is not None and len(X) != len(y):
         raise TaskDirectoryError("Test features and labels have different row counts")
     declared = descriptor.get("n_samples")
-    original_count = reader.get("sample_filtering", {}).get("test", {}).get("input_count", len(y))
+    original_count = reader.get("sample_filtering", {}).get("test", {}).get("input_count", len(X))
     if declared is not None and declared != original_count:
         raise TaskDirectoryError("Test row count differs from the declared test_size")
-    after = {name: _sha256(_source_file(root, name)) for name in relatives}
+    after = {name: _sha256(test_source_path(name)) for name in relatives}
     if before != after or _sha256(descriptor_file) != descriptor_hash:
         raise TaskDirectoryError("Test input or descriptor changed during materialization")
     destination.mkdir(parents=True, exist_ok=True)
     _save_array(destination / "X_test.npy", X)
-    _save_array(destination / "y_test.npy", y)
+    label_name = "y_test.npy" if y is not None else None
+    if label_name is not None:
+        _save_array(destination / label_name, y)
     save_sample_index(destination / "sample_index_test.csv", sample_rows)
     config = {"schema_version": "1.0", "task_id": descriptor["task_id"],
               "source_root": str(destination), "features_path": "X_test.npy",
-              "labels_path": "y_test.npy", "n_samples": len(y)}
+              "labels_path": label_name, "n_samples": len(X)}
     config_path = destination / "test_config.json"
     _write_json(config_path, config)
     _write_json(destination / "test_source.json", {
         "source_root": str(root), "source_files_sha256": after,
         "descriptor_sha256": descriptor_hash, "reader_code_sha256": descriptor["reader_code_sha256"],
-        "reader": reader, "n_samples": len(y),
+        "reader": reader, "n_samples": len(X),
         "original_n_samples": original_count,
         "sample_filtering": reader.get("sample_filtering", {}).get("test", {}),
         "sample_index_path": "sample_index_test.csv",

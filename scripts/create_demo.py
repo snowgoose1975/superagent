@@ -1,4 +1,4 @@
-"""从项目任务模板生成可独立运行的合成优惠券分类任务。"""
+"""Generate a standalone synthetic coupon-classification task from the project template."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def _write_npy_exclusive(path: Path, values: np.ndarray, *, allow_pickle: bool) 
 
 
 def _labels(count: int, n_classes: int, rng: np.random.Generator) -> np.ndarray:
-    # 每类样本数最多相差 1；先保证类别覆盖，再用固定随机种子打乱顺序。
+    # Keep class counts within one sample of each other and shuffle with a fixed seed.
     result = np.arange(count, dtype=np.int64) % n_classes
     rng.shuffle(result)
     return result
@@ -61,11 +61,11 @@ def _features(labels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         for row in range(n_rows):
             values[row, column] = choices[int(rng.integers(0, len(choices)))]
 
-    # 加入数值类别和可学习信号，同时留下其它非完美相关的类别特征。
+    # Include numeric categories, a learnable signal, and imperfectly correlated features.
     values[:, 0] = (55 + 10 * labels + rng.integers(0, 4, size=n_rows)).tolist()
     for row, label in enumerate(labels):
         values[row, 2] = "coffee_house" if int(label) % 2 else "restaurant"
-    # 缺失值使用 NumPy NaN；静态读取器会按缺失值处理。
+    # Use NumPy NaN for missing values so the static reader recognizes them.
     for row in range(n_rows):
         if row % 17 == 0:
             values[row, 10] = float("nan")
@@ -81,24 +81,24 @@ def create_demo(
     n_valid: int = 40,
     n_classes: int = 2,
 ) -> Path:
-    """创建新数据目录与任务配置，返回 demo.json 的绝对路径。"""
+    """Create new data and a task config and return the absolute path to demo.json."""
     output_root = Path(output_root).expanduser().resolve()
     if type(n_classes) is not int or n_classes not in (2, 3):
-        raise ValueError("n_classes 仅支持 2 或 3")
+        raise ValueError("n_classes must be 2 or 3")
     if type(n_train) is not int or n_train < n_classes:
-        raise ValueError("n_train 必须是至少覆盖每类一次的正整数")
+        raise ValueError("n_train must be a positive integer with at least one sample per class")
     if type(n_valid) is not int or n_valid < n_classes:
-        raise ValueError("n_valid 必须是至少覆盖每类一次的正整数")
+        raise ValueError("n_valid must be a positive integer with at least one sample per class")
 
     raw_dir = output_root / "data" / "raw" / "synthetic_coupon"
     config_dir = output_root / "configs"
     config_path = config_dir / "demo.json"
     if raw_dir.exists() or config_path.exists():
-        raise FileExistsError("合成任务目标目录或 configs/demo.json 已存在，拒绝覆盖")
+        raise FileExistsError("The synthetic task directory or configs/demo.json already exists")
 
     template = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
     if len(template.get("feature_columns", [])) != 21:
-        raise ValueError("coupon.json 模板不再声明 21 列，拒绝生成不匹配样例")
+        raise ValueError("The coupon.json template must declare 21 columns to generate matching samples")
 
     config_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=False)

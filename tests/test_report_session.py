@@ -88,7 +88,7 @@ def test_report_contains_leaderboard_metric_curve_usage_and_optional_task_ledger
         tmp_path / "task-budgets",
         "course-task-1",
         budget_rmb="20",
-        profile="deepseek-v4.1-flash-peak-2026-10-21",
+        profile="deepseek-v4.1-flash-offpeak-2026-10-21",
     )
     task_ledger.reserve(
         "session_synthetic:1",
@@ -117,8 +117,27 @@ def test_report_contains_leaderboard_metric_curve_usage_and_optional_task_ledger
     assert "Task-wide formal ledger" in markdown
     assert "model_identity_verified_for_school_endpoint" not in markdown
     assert "not confirmation of the school endpoint" in markdown
-    assert "2.015760" in markdown and "8.063040" in markdown
+    assert "1.007880" in markdown and "4.031520" in markdown
     assert "quick_start/pricing" in markdown
+
+
+def test_report_recalculates_course_offpeak_cost_without_rewriting_ledger(tmp_path):
+    summary_path = _make_project(tmp_path)
+    ledger = TaskBudgetLedger(
+        tmp_path, "course-history", budget_rmb="20",
+        profile="deepseek-v4.1-flash-peak-2026-10-21",
+    )
+    ledger.reserve(
+        "historical:1", session_id="historical", max_input_tokens=1000, max_output_tokens=500,
+    )
+    ledger.settle("historical:1", input_tokens=1000, output_tokens=500)
+    original = ledger.path.read_bytes()
+    output = build_session_report(summary_path, tmp_path / "report", task_ledger_path=ledger.path)
+    markdown = (output / "report.md").read_text(encoding="utf-8")
+    assert "Historically settled: `0.00604728` RMB" in markdown
+    assert "off-peak rate: `0.00302364` RMB" in markdown
+    assert "from `1000` input and `500` output tokens" in markdown
+    assert ledger.path.read_bytes() == original
 
 
 def test_report_refuses_existing_output_and_path_escape(tmp_path):
@@ -128,7 +147,6 @@ def test_report_refuses_existing_output_and_path_escape(tmp_path):
     with pytest.raises(ReportError, match="already exists"):
         build_session_report(summary_path, existing)
 
-    session_dir = summary_path.parent
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["history_path"] = "../../outside/history.jsonl"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")

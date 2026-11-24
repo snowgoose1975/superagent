@@ -12,6 +12,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 _CSV_FIELDS = [
     "trial",
@@ -157,6 +160,8 @@ def _finite_nonnegative(value: Any) -> bool:
 def _task_budget(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
+    from evaluation_d.task_budget import course_offpeak_usage
+
     data = _read_json(path, "task budget ledger")
     if data.get("schema_version") != "1.0" or not isinstance(data.get("reservations"), dict):
         raise ReportError("task budget ledger schema is unsupported")
@@ -193,6 +198,7 @@ def _task_budget(path: Path | None) -> dict[str, Any] | None:
         "remaining_rmb": format(limit - settled - reserved, "f"),
         "counts": counts,
         "price_profile": profile if isinstance(profile, dict) else {},
+        **course_offpeak_usage(data),
     }
 
 
@@ -293,14 +299,14 @@ def _markdown(
             "## Task-wide formal ledger",
             "",
             f"- Budget ID: `{budget['budget_id']}`; limit: `{budget['budget_rmb']}` RMB",
-            f"- Settled: `{budget['settled_cost_rmb']}` RMB; reserved (including unknown): "
+            f"- Historically settled: `{budget['settled_cost_rmb']}` RMB; reserved (including unknown): "
             f"`{budget['reserved_rmb']}` RMB; remaining: `{budget['remaining_rmb']}` RMB",
             f"- Price profile: `{_safe_text(profile.get('profile_id'), 160)}` "
             f"({_safe_text(profile.get('effective_date'), 40)})",
             "- Rates per million tokens: "
             f"input `{_safe_text(profile.get('input_cny_per_million'), 40)}` CNY; "
             f"output `{_safe_text(profile.get('output_cny_per_million'), 40)}` CNY.",
-            "- Source basis: peak/cache-miss USD "
+            f"- Source basis: {_safe_text(basis.get('price_tier'), 100)}. USD "
             f"`{_safe_text(basis.get('usd_input_per_million'), 30)}` input / "
             f"`{_safe_text(basis.get('usd_output_per_million'), 30)}` output; FX "
             f"`{_safe_text(basis.get('fx_cny_per_usd'), 30)}` CNY/USD on "
@@ -308,6 +314,16 @@ def _markdown(
             f"- Profile caveat: {_safe_text(profile.get('billing_caveat'), 400)}",
             f"- Reservation counts: {json.dumps(budget['counts'], sort_keys=True)}",
         ]
+        if "course_offpeak_settled_cost_rmb" in budget:
+            lines.append(
+                "- Course cost for known usage at the October 21, 2026 DeepSeek off-peak rate: "
+                f"`{budget['course_offpeak_settled_cost_rmb']}` RMB "
+                f"from `{budget['settled_input_tokens']}` input and "
+                f"`{budget['settled_output_tokens']}` output tokens."
+            )
+            unpriced_count = budget["course_offpeak_unpriced_settled_count"]
+            if unpriced_count:
+                lines.append(f"- Settled requests without a usable course cost record: `{unpriced_count}`.")
         if sources:
             source_links = ", ".join(
                 f"[source {i}]({url})" for i, url in enumerate(sources, 1)

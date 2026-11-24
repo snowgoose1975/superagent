@@ -160,9 +160,9 @@ def test_plan_v2_rejects_incompatible_model_and_unknown_pipeline_component() -> 
         "representation": "raw_text",
         "pipeline": default_pipeline("raw_text"),
     }
-    with pytest.raises(ContractError, match="does not support|不支持"):
+    with pytest.raises(ContractError, match="does not support"):
         validate_plan(base)
     base["model"] = "logistic_regression"
     base["pipeline"] = {**default_pipeline("raw_text"), "python": {"name": "unsafe"}}
-    with pytest.raises(ContractError, match="unsupported|不支持"):
+    with pytest.raises(ContractError, match="unsupported"):
         validate_plan(base)

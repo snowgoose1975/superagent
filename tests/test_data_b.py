@@ -1,4 +1,4 @@
-"""B 的合成 NPY 契约测试；所有输入与输出目录均留存在 .cache 中。"""
+"""Check B's NPY contracts with synthetic data under the local test cache."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _write_npy(path: Path, values: object) -> None:
 def _task(area: Path, *, task_id: str = "b_test", version: str = "v1") -> dict:
     source = area / f"source-{task_id}"
     source.mkdir()
-    # category_numeric 故意是数字类别；valid 中出现 train 未见过的 30。
+    # category_numeric contains numeric categories. Validation includes unseen category 30.
     train_x = np.asarray(
         [[10, "b_c", "z", 1.0], [20, "q", "c", 2.0], [10, "b_c", "z", 3.0], [20, "q", "c", 4.0]],
         dtype=object,
@@ -41,7 +41,7 @@ def _task(area: Path, *, task_id: str = "b_test", version: str = "v1") -> dict:
     _write_npy(source / "train_labels.npy", np.asarray(["no", "yes", "no", "yes"], dtype="U3"))
     _write_npy(source / "valid_features.npy", valid_x)
     _write_npy(source / "valid_labels.npy", np.asarray(["no", "yes"], dtype="U3"))
-    # 故意不是有效 NPY；无配置引用时 B 不得尝试打开它。
+    # Create invalid NPY data that is outside the configured inputs.
     (source / "test_features.npy").write_bytes(b"test must remain unread")
     return {
         "schema_version": "1.0",
@@ -103,7 +103,7 @@ def test_declared_categorical_unknown_validation_and_train_only_profile() -> Non
     )
     assert len(categories) == 2
     assert not any('"int","30"' in item for item in categories)
-    # category_numeric 的两列 one-hot 结果只有 0/1；未知值 30 的该列组全为 0。
+    # The category's one-hot columns are binary. Unseen category 30 maps to zeros.
     cat_indices = [
         i for i, name in enumerate(manifest["feature_names"]) if "category_numeric" in name
     ]
@@ -189,10 +189,10 @@ def test_source_change_and_prepared_change_are_rejected_without_overwrite() -> N
         np.save(stream, changed, allow_pickle=True)
     changed_result = _prepare(task, area)
     assert changed_result["status"] == "failed"
-    assert "源配置/数据已变化" in changed_result["error"]["message"]
+    assert "inputs changed" in changed_result["error"]["message"]
     assert (package / "data_manifest.json").read_bytes() == original
 
-    # 使用另一份新版本先准备，再改 prepared 数组，以单独覆盖工件摘要拒绝分支。
+    # Tamper with a prepared array in a separate version to test checksum rejection.
     task2 = _task(area, task_id="b_test_artifact", version="v1")
     second = _prepare(task2, area)
     assert second["status"] == "success", second
@@ -203,7 +203,7 @@ def test_source_change_and_prepared_change_are_rejected_without_overwrite() -> N
         np.save(stream, x_train, allow_pickle=False)
     tampered = _prepare(task2, area)
     assert tampered["status"] == "failed"
-    assert "产物缺失或已变化" in tampered["error"]["message"]
+    assert "Cached artifact is missing or changed" in tampered["error"]["message"]
 
 
 def test_incomplete_version_and_explicit_test_partition_are_rejected() -> None:
@@ -214,7 +214,7 @@ def test_incomplete_version_and_explicit_test_partition_are_rejected() -> None:
     (incomplete / "keep.txt").write_text("preserve", encoding="utf-8")
     result = _prepare(task, area)
     assert result["status"] == "failed"
-    assert "没有完整成功记录" in result["error"]["message"]
+    assert "complete successful package" in result["error"]["message"]
     assert (incomplete / "keep.txt").read_text(encoding="utf-8") == "preserve"
 
     task_with_test = _task(area, task_id="b_test_partition", version="v1")
@@ -225,7 +225,7 @@ def test_incomplete_version_and_explicit_test_partition_are_rejected() -> None:
     }
     rejected = _prepare(task_with_test, area)
     assert rejected["status"] == "failed"
-    assert "只能包含 train 与 validation" in rejected["error"]["message"]
+    assert "must contain only train and validation" in rejected["error"]["message"]
     assert not (area / "prepared" / "b_test_partition" / "v1").exists()
 
 
@@ -235,7 +235,7 @@ def test_metric_requires_supported_name_and_boolean_direction() -> None:
     task["primary_metric"]["greater_is_better"] = 1
     result = _prepare(task, area)
     assert result["status"] == "failed"
-    assert "primary_metric 必须是" in result["error"]["message"]
+    assert "primary_metric must be" in result["error"]["message"]
     assert not (area / "prepared" / task["task_id"] / task["data_version"]).exists()
 
 

@@ -70,13 +70,18 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir, *, max_a
         )},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
+    metadata = gateway.metadata() if callable(getattr(gateway, "metadata", None)) else {}
+    byte_limit = metadata.get("max_input_bytes", 16_384)
+    # Leave space for the chat template overhead reserved by the gateway.
+    message_budget = max(0, min(15000, byte_limit - 256))
     messages = initial_messages
     for attempt in range(max_attempts):
         last_attempt = attempt + 1 == max_attempts
         previous_text = None
-        if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > 15000:
+        if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > message_budget:
             raise AnalysisError(
-                "Data preparation context exceeds 15,000 bytes. Shorten the documents or file inventory."
+                f"Data preparation context exceeds {message_budget:,} UTF-8 bytes. "
+                "Shorten the documents or file inventory."
             )
         try:
             reply = gateway.call_llm(messages)
@@ -129,17 +134,17 @@ def _request(gateway, stage, payload, instruction, validate, audit_dir, *, max_a
         # A correction requests a complete plan, so only the latest failed
         # reply and error are needed alongside the original evidence.
         messages = initial_messages.copy()
-        _append_correction(messages, previous_text, correction)
+        _append_correction(messages, previous_text, correction, message_budget)
 
 
-def _append_correction(messages, previous_text, correction):
+def _append_correction(messages, previous_text, correction, message_budget=15000):
     """Provide the failed answer as context without exceeding the B input budget."""
     followup = {"role": "user", "content": correction}
     if previous_text:
         previous = previous_text.encode("utf-8")[:6000].decode("utf-8", errors="ignore")
         while previous:
             answer = {"role": "assistant", "content": previous}
-            if len(json.dumps([*messages, answer, followup], ensure_ascii=False).encode("utf-8")) <= 15000:
+            if len(json.dumps([*messages, answer, followup], ensure_ascii=False).encode("utf-8")) <= message_budget:
                 messages.append(answer)
                 break
             previous = previous.encode("utf-8")[:len(previous.encode("utf-8")) // 2].decode("utf-8", errors="ignore")
@@ -383,6 +388,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         validate_options,
     )
     from .shards import partition_shards
+    from .task_directory import _metric
 
     root = Path(task_dir).resolve(strict=True)
     if not root.is_dir():
@@ -394,6 +400,8 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         document_paths = select_document_paths(root, files, gateway, audit)
     documents = collect_documents(root, files, document_paths)
     _write(audit / "inventory.json", {"files": files, "document_paths": list(documents)})
+    info = _json(documents["info.json"]) if "info.json" in documents else {}
+    declared_metric, metric_source = _metric(info, "\n".join(documents.values()), declarations_only=True)
     schema = {
         "data_type": "tabular/text/image/mixed", "feature_kinds": [],
         "partitions": {"train": {"features": ["relative path"], "labels": None},
@@ -420,6 +428,8 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                                     "NumPy loading arguments are fixed by the program.")
         from evaluation_d.metric_contracts import validate_metric_spec
         validate_metric_spec({"name": value["metric"], "greater_is_better": value["metric"] != "log_loss"})
+        if metric_source != "default_unspecified" and value["metric"] != declared_metric["name"]:
+            raise AnalysisError("The selected metric differs from the documented primary metric")
         evidence = _evidence(value["evidence"], documents)
         if not any(item["field"] == "metric" for item in evidence):
             raise AnalysisError("Missing document evidence for metric")
@@ -427,7 +437,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                 item["field"] == "target_column" and isinstance(value["target_column"], str)
                 and value["target_column"] in item["quote"] for item in evidence):
             raise AnalysisError("The label quote does not name the target column")
-        metric_patterns = {"accuracy": r"\baccuracy\b|\u51c6\u786e\u7387",
+        metric_patterns = {"accuracy": r"(?<![a-z0-9_])(?:accuracy|acc)(?![a-z0-9_])|\u51c6\u786e\u7387",
                            "f1_macro": r"macro[ _-]*f1|f1[ _-]*macro|\u5b8f.*f1",
                            "log_loss": r"log[ _-]*loss|cross[ _-]*entropy|\u5bf9\u6570\u635f\u5931|\u4ea4\u53c9\u71b5"}
         if not any(item["field"] == "metric" and re.search(metric_patterns[value["metric"]], item["quote"], re.IGNORECASE)
@@ -451,7 +461,10 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                 if fmt in {"csv", "tsv", "image_csv", "convert"} and (shard["labels"] is not None or not isinstance(value["target_column"], str) or not value["target_column"].strip()):
                     raise AnalysisError("CSV labels must be embedded in a column, with the labels path set to null")
                 if fmt in {"npy", "text_lines"}:
-                    paths = [*paths, shard["labels"]]
+                    if shard["labels"] is None and role != "test":
+                        raise AnalysisError("Development NPY and text_lines require a labels path")
+                    if shard["labels"] is not None:
+                        paths = [*paths, shard["labels"]]
                 elif shard["labels"] is not None:
                     raise AnalysisError("This reader derives labels from records or class directories")
                 for path in paths:
@@ -461,7 +474,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                         raise AnalysisError(
                             f"partitions.{role}: invalid source {json.dumps(path, ensure_ascii=False)}. "
                             "Copy an exact visible relative path from files, not a wildcard or placeholder. "
-                            "NPY and text_lines require a non-null labels file path."
+                            "Development NPY and text_lines require a non-null labels file path."
                         ) from exc
                     suffix = Path(path).suffix.lower()
                     expected = ".csv" if fmt == "image_csv" else ".txt" if fmt == "text_lines" else "." + fmt
@@ -507,7 +520,7 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
                      "Preserve supplied validation/test splits; omit absent splits or use null. "
                      'For row-sharded CSV/TSV/flat records, NPY or text_lines, use a partition object '
                      '{"shards":[{"features":["exact path"],"labels":null}, ...]} in documented row order. '
-                     "Each NPY/text shard needs its own labels file. Do not put row shards into features: "
+                     "Each development NPY/text shard needs its own labels file. Feature-only test shards omit labels. Do not put row shards into features: "
                      "multiple features denote numeric/categorical COLUMN blocks within one shard. "
                      "Cite every shard path with the corresponding partition evidence; do not merge different splits. "
                      "NPY: provide separate .npy labels. Optional feature_kinds describes each feature file "
@@ -538,7 +551,8 @@ def resolve_layout(task_dir, gateway, audit_dir, document_paths=None):
         elif value["format"] == "npy":
             for prefix, path in zip(value["feature_prefixes"], part["features"], strict=True):
                 inventory[f"{prefix}_{role}.npy"] = path
-            inventory[f"y_{role}.npy"] = part["labels"]
+            if part["labels"] is not None:
+                inventory[f"y_{role}.npy"] = part["labels"]
     metadata = {"metric": value["metric"], "id_columns": value["id_columns"]}
     if value["format"] == "csv":
         metadata["target_column"] = value["target_column"]

@@ -25,7 +25,9 @@ from agent_a.upstream.planner import Planner
 from data_b.modality_readers import combine_text_columns
 from evaluation_d.evaluate import evaluate_training_majority_baseline
 from executor_c.model_factory import build_estimator
-from executor_c.model_registry import capabilities, default_pipeline, normalize_pipeline
+from executor_c.model_registry import (
+    capabilities, default_pipeline, normalize_pipeline, runtime_capabilities,
+)
 
 import main as team_main
 from evaluation_d.school_gateway import SchoolGateway
@@ -373,8 +375,28 @@ class AutomaticTaskRunTests(unittest.TestCase):
         self.assertEqual(team_main._automatic_budget_id(output_root, discovery), "legacy_task_budget")
         auto_id = "auto_" + fingerprint[:40]
         (ledger_root / f"{auto_id}.json").write_text("{}", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "多个历史预算账本"):
+        with self.assertRaisesRegex(ValueError, "Multiple historical ledgers"):
             team_main._automatic_budget_id(output_root, discovery)
+
+    def test_unverified_legacy_identity_cannot_create_or_adopt_ledger(self) -> None:
+        root = self.root / "deleted_prepared"
+        session = root / "sessions" / "session_previous"
+        ledger = root / "sessions" / "task-budgets"
+        session.mkdir(parents=True)
+        ledger.mkdir()
+        (ledger / "legacy.json").write_text("{}", encoding="utf-8")
+        (session / "summary.json").write_text(json.dumps({
+            "task_id": "legacy_table",
+            "data_manifest_path": "data/prepared/legacy_table/v1/data_manifest.json",
+            "llm_gateway": {"task_budget": {"budget_id": "legacy"}},
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Cannot verify historical ledgers"):
+            team_main._automatic_budget_id(root, {
+                "budget_fingerprint": "a" * 64, "task_id": "legacy_table",
+            })
+        self.assertEqual(team_main._automatic_budget_id(root, {
+            "budget_fingerprint": "b" * 64, "task_id": "unrelated",
+        }), "auto_" + "b" * 40)
 
     def test_manual_task_spec_entry_remains_compatible(self) -> None:
         from scripts.create_demo import create_demo
@@ -391,6 +413,36 @@ class AutomaticTaskRunTests(unittest.TestCase):
         self.assertEqual(summary["status"], "success", summary)
         self.assertEqual(summary["input_mode"], "config")
         self.assertEqual(summary["test_evaluation"]["status"], "not_requested")
+
+    def test_manual_school_budget_cap_is_checked_before_key_loading(self) -> None:
+        for amount in ("-1", "NaN", "500"):
+            with self.subTest(amount=amount), mock.patch("evaluation_d.env_config.load_api_key") as key_loader:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = team_main.main([
+                        "run", "--config", str(self.root / "unused.json"), "--planner", "school",
+                        "--llm-budget-rmb", amount,
+                    ])
+                self.assertEqual(code, 2)
+                key_loader.assert_not_called()
+
+    def test_malformed_decision_leaves_room_for_valid_trial(self) -> None:
+        from scripts.create_demo import create_demo
+
+        config = create_demo(self.root, n_train=48, n_valid=12)
+        spec = _read_json(config)
+        spec["train_policy"]["max_trials"] = 2
+        config.write_text(json.dumps(spec), encoding="utf-8")
+        controller = _OneTrialController([])
+        good = controller.decide({})
+        with (
+            mock.patch.object(controller, "decide", side_effect=[{"action": "run"}, good]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            summary = _read_json(team_main.run_project(config, self.root, controller=controller))
+        self.assertEqual(summary["status"], "success", summary.get("error"))
+        self.assertEqual(summary["attempted_trials"], 1)
+        self.assertEqual(summary["rejected_decisions"][0]["trial"], 1)
+        self.assertTrue(summary["best_experiment_id"].endswith("_002"))
 
     def test_automatic_npy_images_run_to_final_test(self) -> None:
         source = self.root / "unknown_image_collection"
@@ -480,7 +532,9 @@ class GeneralRecipeTests(unittest.TestCase):
             "timeout_seconds": 120,
             "search_profile": "expanded",
             "data_overview": {"n_features": 2, "representations": ["raw_text"]},
-            "capabilities": capabilities(),
+            "capabilities": runtime_capabilities(
+                "raw_text", min_class_count=10, native_table=False, performance=False,
+            ),
         }
         recipes = set()
         for _ in range(12):
@@ -627,7 +681,7 @@ class GeneralRecipeTests(unittest.TestCase):
         manifest = _read_json(manifest_path)
         manifest["data_version"] = "different-version"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "任务身份不一致"):
+        with self.assertRaisesRegex(ValueError, "identity"):
             evaluate_training_majority_baseline(
                 task / "evaluation_manifest.json", {"minor": 2, "major": 8}
             )

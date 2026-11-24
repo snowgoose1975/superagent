@@ -534,7 +534,7 @@ class BLLMTests(unittest.TestCase):
     def test_cli_requires_stable_budget_before_loading_key(self):
         with patch("evaluation_d.env_config.load_api_key") as key_loader:
             code = team_main.main(["run", "--task", str(self.source), "--planner", "school", "--b-analysis", "llm"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 1)
         key_loader.assert_not_called()
 
     def test_cli_initializes_one_gateway_for_all_three_stages(self):

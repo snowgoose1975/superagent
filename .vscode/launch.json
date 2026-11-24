@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "阅读主流程：优惠券任务（离线 A）",
+      "name": "Coupon workflow with offline planning",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/main.py",
@@ -13,7 +13,7 @@
       "justMyCode": true
     },
     {
-      "name": "学校 API：读取根 .env，最多规划一次",
+      "name": "School API with project .env and one request",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/main.py",

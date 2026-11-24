@@ -24,6 +24,12 @@ from executor_c.model_registry import (
 
 SCHEMA_VERSION = "1.0"
 MAX_TIMEOUT_SECONDS = REGISTRY_MAX_TIMEOUT_SECONDS
+_MIB = 1024 * 1024
+_MAX_MANIFEST_BYTES = 64 * _MIB
+_MAX_DENSE_PAYLOAD_BYTES = 256 * _MIB
+_MAX_NPY_HEADER_BYTES = 64 * 1024 + 12
+_MAX_LABEL_ROWS = 2_000_000
+_MAX_IDS_BYTES = 128 * _MIB
 IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 PLAN_FIELDS = {
     "schema_version",
@@ -85,15 +91,27 @@ def _finite_float(value: str) -> float:
     return number
 
 
-def read_json(path: str | Path, error_code: str = "DATA_INVALID") -> dict[str, Any]:
+def read_json(
+    path: str | Path, error_code: str = "DATA_INVALID", *, max_bytes: int | None = None,
+) -> dict[str, Any]:
     """Read a standard JSON object while keeping raw input out of error messages."""
     try:
+        if max_bytes is None:
+            content = Path(path).read_text(encoding="utf-8-sig")
+        else:
+            with Path(path).open("rb") as stream:
+                raw = stream.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ContractError(error_code, "The JSON file exceeds its size limit")
+            content = raw.decode("utf-8-sig")
         value = json.loads(
-            Path(path).read_text(encoding="utf-8-sig"),
+            content,
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
             parse_float=_finite_float,
         )
+    except ContractError:
+        raise
     except (OSError, ValueError, UnicodeError) as exc:
         raise ContractError(error_code, "Could not read a valid UTF-8 JSON object") from exc
     if not isinstance(value, dict):
@@ -118,10 +136,14 @@ def publish_json(path: str | Path, value: Any) -> None:
     pending.rename(destination)
 
 
-def sha256_file(path: str | Path) -> str:
+def sha256_file(path: str | Path, *, max_bytes: int | None = None) -> str:
     digest = hashlib.sha256()
+    total = 0
     with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        for chunk in iter(lambda: stream.read(_MIB), b""):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError("File grew beyond its size limit during hashing")
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -228,7 +250,7 @@ def resolve_data_path(base_dir: str | Path, relative: Any) -> Path:
 
 def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[str, Any]:
     """Validate metadata first. The worker validates array contents within its time limit."""
-    manifest = read_json(manifest_path)
+    manifest = read_json(manifest_path, max_bytes=_MAX_MANIFEST_BYTES)
     required_v1 = {
         "schema_version",
         "task_id",
@@ -328,8 +350,10 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
     _fields(manifest["validation"], validation_fields, "DATA_INVALID", "validation")
     base = Path(manifest_path).resolve().parent
     for split in ("train", "validation"):
-        if not _integer(manifest[split]["n_samples"], 1):
-            raise ContractError("DATA_INVALID", f"{split}.n_samples must be a positive integer")
+        if not _integer(manifest[split]["n_samples"], 1, _MAX_LABEL_ROWS):
+            raise ContractError("DATA_INVALID", f"{split}.n_samples is outside the supported row count")
+        if version == "1.0" and manifest[split]["n_samples"] * manifest["n_features"] * 4 > _MAX_DENSE_PAYLOAD_BYTES:
+            raise ContractError("DATA_INVALID", f"{split} dense feature matrix exceeds the 256 MiB limit")
         for key in ("features_path", "labels_path", "sample_ids_path"):
             if key in manifest[split]:
                 resolve_data_path(base, manifest[split][key])
@@ -341,6 +365,8 @@ def validate_manifest(manifest_path: str | Path, plan: dict[str, Any]) -> dict[s
 
 
 def read_sample_ids(path: str | Path, expected_count: int) -> list[str]:
+    if Path(path).stat().st_size > _MAX_IDS_BYTES:
+        raise ContractError("DATA_INVALID", "Validation IDs exceed the input size limit")
     try:
         with Path(path).open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.reader(stream)
@@ -348,6 +374,8 @@ def read_sample_ids(path: str | Path, expected_count: int) -> list[str]:
                 raise ContractError("DATA_INVALID", "valid_ids.csv must have exactly one header, sample_id")
             ids = []
             for row in reader:
+                if len(ids) >= expected_count:
+                    raise ContractError("DATA_INVALID", "Validation IDs exceed the manifest row count")
                 if (
                     len(row) != 1
                     or not row[0].strip()
@@ -387,17 +415,44 @@ def _input_paths(manifest_path: str | Path, manifest: dict[str, Any]) -> dict[st
     return files
 
 
+def _hash_prepared_inputs(files: dict[str, Path], representation: str) -> dict[str, str]:
+    from data_b.modality_readers import MAX_TEXT_JSONL_BYTES
+    from data_b.npy_reader import ReaderLimits
+
+    feature_limit = {
+        "dense_numeric": _MAX_DENSE_PAYLOAD_BYTES + _MAX_NPY_HEADER_BYTES,
+        "raw_text": MAX_TEXT_JSONL_BYTES,
+        "image_tensor": ReaderLimits().max_payload_bytes + _MAX_NPY_HEADER_BYTES,
+    }[representation]
+    limits = {
+        "manifest": _MAX_MANIFEST_BYTES,
+        "train_features": feature_limit,
+        "train_labels": _MAX_LABEL_ROWS * 8 + _MAX_NPY_HEADER_BYTES,
+        "validation_features": feature_limit,
+        "validation_ids": _MAX_IDS_BYTES,
+        "preprocessor": 1024 * _MIB,
+    }
+    # Check every input before streaming any potentially large file.
+    for name, path in files.items():
+        if path.stat().st_size > limits[name]:
+            raise ValueError(f"The prepared {name} file exceeds its size limit")
+    return {name: sha256_file(path, max_bytes=limits[name]) for name, path in files.items()}
+
+
 def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> PreparedData:
     """Load the executor inputs and leave validation labels to the evaluator."""
     import numpy as np
-    from data_b.npy_reader import read_npy_array
+    from data_b.npy_reader import ReaderLimits, read_npy_array
 
     manifest = validate_manifest(manifest_path, plan)
     files = _input_paths(manifest_path, manifest)
-    hashes_before = {name: sha256_file(path) for name, path in files.items()}
     representation = manifest.get("representation", "dense_numeric")
     try:
-        y_train = np.load(files["train_labels"], allow_pickle=False)
+        hashes_before = _hash_prepared_inputs(files, representation)
+        y_train = read_npy_array(
+            files["train_labels"], expected_shape=(manifest["train"]["n_samples"],),
+            allowed_dtype_kinds="i", allowed_item_sizes=(4, 8),
+        )
         if representation == "raw_text":
             from data_b.modality_readers import read_text_matrix_jsonl
 
@@ -416,11 +471,24 @@ def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> Prepa
             )
         else:
             if representation == "image_tensor":
-                X_train = read_npy_array(files["train_features"])
-                X_valid = read_npy_array(files["validation_features"])
+                shape = tuple(manifest["modality"]["image_shape"])
+                limits = None
+                kinds, item_sizes = "fiu", None
             else:
-                X_train = np.load(files["train_features"], allow_pickle=False)
-                X_valid = np.load(files["validation_features"], allow_pickle=False)
+                shape = (manifest["n_features"],)
+                # Image-index tables can have more columns than the legacy tabular bound.
+                limits = ReaderLimits(
+                    max_columns=manifest["n_features"], max_payload_bytes=_MAX_DENSE_PAYLOAD_BYTES,
+                )
+                kinds, item_sizes = "f", (4, 8)
+            X_train, X_valid = [
+                read_npy_array(
+                    files[f"{split}_features"], limits,
+                    expected_shape=(manifest[split]["n_samples"], *shape),
+                    allowed_dtype_kinds=kinds, allowed_item_sizes=item_sizes,
+                )
+                for split in ("train", "validation")
+            ]
     except (OSError, ValueError, EOFError, TypeError) as exc:
         raise ContractError("DATA_INVALID", "Could not read train or validation features matching the manifest") from exc
     for name, value, count in (
@@ -467,7 +535,10 @@ def load_prepared_data(manifest_path: str | Path, plan: dict[str, Any]) -> Prepa
     if not np.array_equal(np.unique(y_train), np.asarray(class_ids)):
         raise ContractError("DATA_INVALID", "Training labels must cover exactly classes 0..K-1")
     sample_ids = read_sample_ids(files["validation_ids"], X_valid.shape[0])
-    hashes = {name: sha256_file(path) for name, path in files.items()}
+    try:
+        hashes = _hash_prepared_inputs(files, representation)
+    except (OSError, ValueError) as exc:
+        raise ContractError("DATA_INVALID", "An input became invalid while reading") from exc
     if hashes != hashes_before:
         raise ContractError("DATA_INVALID", "Inputs changed while reading. Freeze a data version and retry.")
     return PreparedData(manifest, X_train, y_train, X_valid, sample_ids, class_ids, hashes)
@@ -519,13 +590,17 @@ def inspect_artifacts(
 ) -> dict[str, Any]:
     """Verify the worker artifacts before publishing a successful result."""
     run_dir = Path(run_dir).resolve()
-    for name in ("model.joblib", "predictions.csv", "worker_metadata.json"):
+    for name, limit in (
+        ("model.joblib", 1024 * _MIB),
+        ("predictions.csv", 512 * _MIB),
+        ("worker_metadata.json", _MIB),
+    ):
         file_path = run_dir / name
         if not file_path.is_file() or file_path.resolve().parent != run_dir:
             raise ContractError("ARTIFACT_INVALID", "Training did not generate all experiment artifacts")
-        if file_path.stat().st_size == 0:
-            raise ContractError("ARTIFACT_INVALID", "A training artifact is empty")
-    metadata = read_json(run_dir / "worker_metadata.json", error_code="ARTIFACT_INVALID")
+        if not 0 < file_path.stat().st_size <= limit:
+            raise ContractError("ARTIFACT_INVALID", f"{name} is empty or exceeds the artifact size limit")
+    metadata = read_json(run_dir / "worker_metadata.json", error_code="ARTIFACT_INVALID", max_bytes=_MIB)
     class_ids = [item["id"] for item in manifest["classes"]]
     if (
         metadata.get("class_ids") != class_ids
@@ -558,11 +633,11 @@ def inspect_artifacts(
     ):
         raise ContractError("ARTIFACT_INVALID", "The worker lacks the full input file checksums")
     try:
-        if read_json(manifest_path) != manifest:
+        if read_json(manifest_path, max_bytes=_MAX_MANIFEST_BYTES) != manifest:
             raise ContractError("ARTIFACT_INVALID", "The data manifest description changed during the run")
         files = _input_paths(manifest_path, manifest)
-        current_hashes = {name: sha256_file(path) for name, path in files.items()}
-    except (ContractError, OSError) as exc:
+        current_hashes = _hash_prepared_inputs(files, manifest.get("representation", "dense_numeric"))
+    except (OSError, ValueError) as exc:
         raise ContractError("ARTIFACT_INVALID", "An input became unavailable during the run. Check the frozen data version.") from exc
     if input_hashes != current_hashes:
         raise ContractError("ARTIFACT_INVALID", "An input changed during the run. Use a new data version.")

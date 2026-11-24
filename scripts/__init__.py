@@ -1,1 +1,1 @@
-"""项目开发辅助脚本。"""
+"""Project development utilities."""

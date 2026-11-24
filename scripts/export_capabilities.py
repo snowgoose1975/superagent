@@ -15,7 +15,7 @@ OUTPUT_PATH = PROJECT_ROOT / "executor_c" / "capabilities.json"
 def main() -> int:
     content = json.dumps(capabilities(), ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     OUTPUT_PATH.write_text(content, encoding="utf-8", newline="\n")
-    print(f"已从模型注册表生成能力清单：{OUTPUT_PATH}")
+    print(f"Exported model registry capabilities to {OUTPUT_PATH}")
     return 0
 
 

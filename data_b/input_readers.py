@@ -176,7 +176,7 @@ def _json(value):
     return json.loads(value, object_pairs_hook=_unique, parse_constant=invalid)
 
 
-def _record_rows(path, format_name, options, *, skip_field=None):
+def _record_rows(path, format_name, options, *, skip_field=None, optional_field=None):
     text = _text(path)
     source = options.get("source_format", format_name)
     if source == "json":
@@ -198,10 +198,18 @@ def _record_rows(path, format_name, options, *, skip_field=None):
     if format_name == "convert":
         fields = options["field_paths"]
         try:
-            rows = [{name: row[keys[0]] for name, keys in fields.items() if name != skip_field} for row in rows]
+            rows = [{name: row[keys[0]] for name, keys in fields.items() if name != skip_field and (name != optional_field or keys[0] in row)}
+                    for row in rows]
         except KeyError as exc:
             raise InputReaderError("A configured top-level conversion field is missing") from exc
     return rows
+
+
+def _prediction_only(records, target):
+    present = [target in row for row in records]
+    if any(present) and not all(present):
+        raise InputReaderError("Test target must be present on every row or omitted from every row")
+    return not any(present)
 
 
 def _directory_files(root, relative, extensions):
@@ -327,12 +335,13 @@ def read_split(root, files, reader, split, touch, *, fit=False, prediction=False
         extensions = IMAGE_EXTENSIONS if fmt == "image_directory" else {".txt"}
         directory = source_path(root, source, directory=True)
         visible = [p for p in sorted(directory.iterdir()) if not p.name.startswith(".")]
-        if prediction and visible and all(p.is_file() and p.suffix.lower() in extensions for p in visible):
-            entries = [(p.relative_to(root).as_posix(), "__prediction__") for p in visible]
+        if prediction is not False and visible and all(p.is_file() and p.suffix.lower() in extensions for p in visible):
+            entries = [(p.relative_to(root).as_posix(), None) for p in visible]
+            prediction = True
         else:
             entries = _directory_files(root, source, extensions)
         ids = [name for name, _ in entries]
-        y = td._labels(np.asarray([label for _, label in entries], dtype=object))
+        y = None if prediction else td._labels(np.asarray([label for _, label in entries], dtype=object))
         if fmt == "image_directory":
             X = _image_batch(root, [name for name, _ in entries], reader, touch, fit=fit)
             if fit:
@@ -359,26 +368,29 @@ def read_split(root, files, reader, split, touch, *, fit=False, prediction=False
     path = source_path(root, source)
     if fmt == "text_lines":
         label_path = files.get("labels_path")
+        if prediction is None:
+            prediction = label_path is None
         if not label_path and not prediction:
             raise InputReaderError("text_lines requires a separate labels file")
         texts = _text(path).splitlines()
-        if prediction:
-            labels = ["__prediction__"] * len(texts)
-        else:
+        labels = None
+        if not prediction:
             touch(label_path)
-            labels = _text(source_path(root, label_path)).splitlines()
-        if not 1 <= len(texts) <= MAX_ROWS or len(texts) != len(labels):
+            labels = np.asarray(_text(source_path(root, label_path)).splitlines(), dtype=object)
+        if not 1 <= len(texts) <= MAX_ROWS or (labels is not None and len(texts) != len(labels)):
             raise InputReaderError("Text and label line counts must match; labels cannot be empty")
         if fit:
             _set_text(reader, ["text"])
         raw, labels, sample_rows = td._filter_array_samples(
-            np.asarray(texts, dtype=object).reshape(-1, 1), np.asarray(labels, dtype=object),
-            td._array_sample_rows(len(labels), files, split), reader, split)
-        if any(not label.strip() for label in labels):
+            np.asarray(texts, dtype=object).reshape(-1, 1), labels,
+            td._array_sample_rows(len(texts), files, split), reader, split)
+        if labels is not None and any(not label.strip() for label in labels):
             raise InputReaderError("Labels cannot be empty on retained text samples")
-        return td._text_matrix(raw), td._labels(labels), sample_rows
+        return td._text_matrix(raw), None if labels is None else td._labels(labels), sample_rows
     if fmt == "image_csv":
         header, values = td._read_csv(path)
+        if prediction is None:
+            prediction = reader["target_column"] not in header
         records = [dict(zip(header, row, strict=True)) for row in values]
         if len(records) > MAX_ROWS:
             raise InputReaderError("Image index exceeds the sample limit")
@@ -416,14 +428,18 @@ def read_split(root, files, reader, split, touch, *, fit=False, prediction=False
                 reader["mixed_inputs"] = ["image", *sorted(set(auxiliary.values()))]
         else:
             images = _image_batch(root, image_paths, reader, touch, fit=fit)
-            y = td._labels(np.asarray(["__prediction__" if prediction else row[reader["target_column"]]
-                                      for row in records], dtype=object))
+            y = None if prediction else td._labels(np.asarray([row[reader["target_column"]]
+                                                               for row in records], dtype=object))
             ids = _record_ids(records, reader, split, source_rows)
             if fit:
                 reader.update(output_kind="image", modality=td._image_modality(images), feature_columns=[])
             return images, y, _indices(ids, image_paths, source_rows)
     else:
-        records = _record_rows(path, fmt, options, skip_field=reader["target_column"] if prediction else None)
+        records = _record_rows(path, fmt, options,
+                               skip_field=reader["target_column"] if prediction else None,
+                               optional_field=reader["target_column"] if prediction is None else None)
+        if prediction is None:
+            prediction = _prediction_only(records, reader["target_column"])
     return _records_to_arrays(records, reader, source, split, fit=fit, prediction=prediction,
                               source_rows=source_rows if fmt == "image_csv" else None, filter_missing=fmt != "image_csv")
 
@@ -473,7 +489,7 @@ def _records_to_arrays(records, reader, source, split, *, fit, prediction=False,
         raise InputReaderError("Record input exceeds the array element limit")
     try:
         X = np.asarray([[row[c] for c in columns] for row in records], dtype=object)
-        y = td._labels(np.asarray(["__prediction__" if prediction else row[target] for row in records], dtype=object))
+        y = None if prediction else td._labels(np.asarray([row[target] for row in records], dtype=object))
     except KeyError as exc:
         raise InputReaderError("A feature or target field is missing") from exc
     if any(isinstance(value, (dict, list)) for value in X.flat):
@@ -492,7 +508,15 @@ def _records_to_arrays(records, reader, source, split, *, fit, prediction=False,
 
 
 def reader_hash():
-    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("shards.py").read_bytes()).hexdigest()
+    source_modules = (
+        "input_readers.py", "task_directory.py", "shards.py", "npy_reader.py",
+        "raw_reader.py", "modality_readers.py", "sample_index.py",
+    )
+    manifest = {
+        filename: hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
+        for filename in source_modules
+    }
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("ascii")).hexdigest()
 
 
 def normalize_prediction_input(rules_path, root, relative, destination):
@@ -577,7 +601,8 @@ def additional_contract(root, inventory, info, resolution=None, *, allow_auto=Tr
         if not isinstance(part, dict) or set(part) != {"features", "labels"} or not isinstance(part["features"], list) or len(part["features"]) != 1:
             raise InputReaderError("Each split needs one feature source and a labels field")
         names = [*part["features"], *([part["labels"]] if part["labels"] is not None else [])]
-        if (fmt == "text_lines") != (part["labels"] is not None):
+        if ((fmt != "text_lines" and part["labels"] is not None)
+                or (fmt == "text_lines" and part["labels"] is None and role != "test")):
             raise InputReaderError("Only text_lines uses separate labels in additional readers")
         for name in names:
             if (not isinstance(name, str) or not name or "\\" in name or PureWindowsPath(name).drive

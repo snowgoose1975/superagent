@@ -16,12 +16,14 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from evaluation_d.task_budget import TaskBalanceExhausted
+from evaluation_d.task_budget import COURSE_BUDGET_LIMIT_RMB, TaskBalanceExhausted, TaskBudgetError
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 4096
 _DEFAULT_OUTPUT_TOKENS = 1024
-_MAX_INPUT_BYTES = 16384
+_DEFAULT_INPUT_LIMIT = 16_384
+_MAX_INPUT_BYTES = 131_072
+_MAX_INPUT_TOKENS = 131_072
 _CHAT_TEMPLATE_OVERHEAD_BYTES = 256
 _SECRET_CONFIG_KEYS = {
     "api_key",
@@ -111,7 +113,10 @@ def _safe_config(config: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         "pricing_profile": value.get("pricing_profile"),
         "pricing_tier": value.get("pricing_tier"),
         "max_tokens": value.get("max_tokens", _DEFAULT_OUTPUT_TOKENS),
-        "max_input_tokens": value.get("max_input_tokens", _MAX_INPUT_BYTES),
+        "max_input_tokens": value.get("max_input_tokens", _DEFAULT_INPUT_LIMIT),
+        "max_input_bytes": value.get(
+            "max_input_bytes", value.get("max_input_tokens", _DEFAULT_INPUT_LIMIT)
+        ),
         "timeout": value.get("timeout", 90),
     }
 
@@ -220,6 +225,12 @@ class SchoolGateway:
             self._config["max_input_tokens"],
             "max_input_tokens",
             minimum=1,
+            maximum=_MAX_INPUT_TOKENS,
+        )
+        self._max_input_bytes = _strict_int(
+            self._config["max_input_bytes"],
+            "max_input_bytes",
+            minimum=1,
             maximum=_MAX_INPUT_BYTES,
         )
         timeout = self._config["timeout"]
@@ -238,8 +249,8 @@ class SchoolGateway:
         self._api_key = api_key
         self._max_calls = max_calls
         self._budget = _decimal(budget_rmb, "budget_rmb")
-        if self._budget <= 0:
-            raise GatewayError("CONFIG_INVALID", "budget_rmb must be greater than zero.")
+        if not 0 < self._budget <= COURSE_BUDGET_LIMIT_RMB:
+            raise GatewayError("CONFIG_INVALID", "budget_rmb must be greater than zero and at most CNY 20.")
         self._transport = transport if transport is not None else _urllib_transport
         self._is_injected = transport is not None
         self._task_budget_ledger = task_budget_ledger
@@ -250,11 +261,15 @@ class SchoolGateway:
         )
         self._pricing_profile = self._config.get("pricing_profile")
         self._pricing_tier = self._config.get("pricing_tier")
-        self._task_budget_profile = (
-            task_price_profile.get("profile_id")
-            if isinstance(task_price_profile, dict)
-            else None
-        )
+        self._task_budget_profile = None
+        if task_budget_ledger is not None:
+            if not isinstance(task_price_profile, dict):
+                raise GatewayError("CONFIG_INVALID", "Attached task ledger has no pricing profile.")
+            self._task_budget_profile = task_price_profile["profile_id"]
+            self._pricing_profile = self._task_budget_profile
+            self._pricing_tier = task_price_profile["source_basis"].get("price_tier")
+            self._input_price = Decimal(task_price_profile["input_cny_per_million"])
+            self._output_price = Decimal(task_price_profile["output_cny_per_million"])
 
         self._known_input_tokens = 0
         self._known_output_tokens = 0
@@ -264,6 +279,7 @@ class SchoolGateway:
         self._usage_pending = False
         self._blocked = False
         self._blocked_reason: str | None = None
+        self._task_budget_error: str | None = None
         self._last_completion: dict[str, Any] | None = None
         self._call_attempts = 0
         self._real_llm_calls = 0
@@ -292,7 +308,10 @@ class SchoolGateway:
     def remaining_budget_rmb(self) -> float:
         remaining = self._remaining_decimal()
         if self._task_budget_ledger is not None:
-            task_remaining = Decimal(self._task_budget_ledger.snapshot()["remaining_rmb"])
+            try:
+                task_remaining = Decimal(self._task_budget_ledger.snapshot()["remaining_rmb"])
+            except (TaskBudgetError, OSError):
+                return 0.0
             remaining = min(remaining, task_remaining)
         return float(remaining)
 
@@ -365,6 +384,13 @@ class SchoolGateway:
             if self._usage_unknown or self._usage_pending
             else ("known" if self._call_attempts else "not_called")
         )
+        task_budget = None
+        task_budget_error = self._task_budget_error
+        if self._task_budget_ledger is not None:
+            try:
+                task_budget = self._task_budget_ledger.snapshot()
+            except (TaskBudgetError, OSError):
+                task_budget_error = task_budget_error or "snapshot_failed"
         return {
             "session_id": self._session_id,
             "model": self._model,
@@ -375,7 +401,7 @@ class SchoolGateway:
             "call_attempts": self._call_attempts,
             "max_calls": self._max_calls,
             "blocked": self._blocked,
-            "can_call": self.can_call,
+            "can_call": self.can_call and task_budget_error is None,
             "blocked_reason": self._blocked_reason,
             "last_completion": self._last_completion,
             "usage_status": usage_status,
@@ -394,14 +420,12 @@ class SchoolGateway:
             "budget_rmb": format(self._budget, "f"),
             "remaining_budget_rmb": format(self._remaining_decimal(), "f"),
             "max_input_tokens": self._max_input_tokens,
+            "max_input_bytes": self._max_input_bytes,
             "max_output_tokens": self._max_tokens,
             "transport": "injected" if self._is_injected else "urllib",
             "ledger_path": str(self._session_dir.resolve()),
-            "task_budget": (
-                self._task_budget_ledger.snapshot()
-                if self._task_budget_ledger is not None
-                else None
-            ),
+            "task_budget": task_budget,
+            "task_budget_error": task_budget_error,
         }
 
     def _persist_metadata(self) -> None:
@@ -434,7 +458,7 @@ class SchoolGateway:
             except Exception:
                 # A still-pending task reservation remains fully charged if its
                 # status update fails; the local session is nevertheless blocked.
-                self._blocked_reason = "task_ledger_update_failed"
+                self._task_budget_error = "mark_unknown_failed"
         self._usage_unknown = True
         self._usage_pending = False
         self._reserved = available_before
@@ -445,6 +469,7 @@ class SchoolGateway:
                 "attempt": attempt,
                 "status": "unknown",
                 "error_code": code,
+                "task_budget_error": self._task_budget_error,
                 "input_tokens": None,
                 "output_tokens": None,
                 "estimated_cost_rmb": None,
@@ -463,7 +488,6 @@ class SchoolGateway:
         self, attempt: int, input_tokens: int, output_tokens: int, *, status: str
     ) -> Decimal:
         cost = self._charge(input_tokens, output_tokens)
-        task_ledger_failed = False
         if self._task_budget_ledger is not None:
             try:
                 self._task_budget_ledger.settle(
@@ -472,7 +496,9 @@ class SchoolGateway:
                     output_tokens=output_tokens,
                 )
             except Exception:
-                task_ledger_failed = True
+                self._task_budget_error = "settlement_failed"
+                self._blocked = True
+                self._blocked_reason = "task_ledger_settle_failed"
         self._known_input_tokens += input_tokens
         self._known_output_tokens += output_tokens
         self._known_cost += cost
@@ -488,12 +514,12 @@ class SchoolGateway:
                 "estimated_cost_rmb": format(cost, "f"),
                 "reserved_rmb": "0",
                 "completion": self._last_completion,
+                "task_budget_error": self._task_budget_error,
                 **self._pricing_log_fields(),
             }
         )
         self._persist_metadata()
-        if task_ledger_failed:
-            self._block("task_ledger_settle_failed")
+        if self._task_budget_error:
             raise GatewayError(
                 "TASK_LEDGER_ERROR",
                 "School API usage is known but ledger settlement failed. The session is blocked.",
@@ -563,7 +589,7 @@ class SchoolGateway:
         except (TypeError, ValueError, UnicodeError):
             raise GatewayError("INPUT_INVALID", "messages must be serializable as JSON.") from None
         input_bound_bytes = len(serialized_messages) + _CHAT_TEMPLATE_OVERHEAD_BYTES
-        if input_bound_bytes > self._max_input_tokens:
+        if input_bound_bytes > self._max_input_bytes:
             self._block("input_too_large")
             raise GatewayError("INPUT_TOO_LARGE", "Messages exceeded the UTF-8 input limit. No request was sent.")
 
@@ -591,6 +617,7 @@ class SchoolGateway:
                 ) from None
             except Exception:
                 self._call_attempts -= 1
+                self._task_budget_error = "reservation_failed"
                 self._block("task_budget_reservation_failed")
                 raise GatewayError(
                     "TASK_BUDGET_EXCEEDED",
@@ -607,6 +634,7 @@ class SchoolGateway:
                 "attempt": attempt,
                 "status": "reserved",
                 "input_upper_bound_bytes": input_bound_bytes,
+                "max_input_bytes": self._max_input_bytes,
                 "max_input_tokens": self._max_input_tokens,
                 "max_output_tokens": self._max_tokens,
                 "reserved_rmb": format(reserve, "f"),
@@ -639,6 +667,9 @@ class SchoolGateway:
 
         try:
             status, body = self._safe_transport(request)
+        except KeyboardInterrupt:
+            self._unknown(attempt, "INTERRUPTED", available_before)
+            raise
         except GatewayError as exc:
             self._unknown(attempt, exc.code, available_before)
             raise exc from None
@@ -662,8 +693,6 @@ class SchoolGateway:
             self._unknown(attempt, "USAGE_UNKNOWN", available_before)
             raise GatewayError("USAGE_UNKNOWN", "The school API did not return valid usage. The session is blocked.")
         input_tokens, output_tokens = usage
-        cost = self._charge(input_tokens, output_tokens)
-
         # Record the reported usage even when it exceeds the reservation, then block the session.
         usage_exceeds_reservation = (
             input_tokens > self._max_input_tokens or output_tokens > self._max_tokens
@@ -702,7 +731,7 @@ class SchoolGateway:
                 )
             raise GatewayError(error_code, "The school API reply contained no usable text. Usage was recorded.")
 
-        self._record_known(attempt, input_tokens, output_tokens, status="complete")
+        cost = self._record_known(attempt, input_tokens, output_tokens, status="complete")
         return {
             "text": text_value,
             "input_tokens": input_tokens,

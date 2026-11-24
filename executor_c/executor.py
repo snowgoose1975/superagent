@@ -136,6 +136,10 @@ def execute(
                 Path(__file__).with_name("model_factory.py"),
                 "model_factory.snapshot.py",
             ),
+            "capabilities.json": (
+                Path(__file__).with_name("capabilities.json"),
+                "capabilities.snapshot.json",
+            ),
             "diagnostics.py": (
                 Path(__file__).with_name("diagnostics.py"),
                 "diagnostics.snapshot.py",
@@ -148,20 +152,30 @@ def execute(
                 Path(__file__).resolve().parents[1] / "data_b" / "modality_readers.py",
                 "modality_readers.snapshot.py",
             ),
+            "npy_reader.py": (
+                Path(__file__).resolve().parents[1] / "data_b" / "npy_reader.py",
+                "npy_reader.snapshot.py",
+            ),
         }
         if plan.get("model") == "catboost":
             source_paths["native_table.py"] = (
                 Path(__file__).with_name("native_table.py"), "native_table.snapshot.py",
             )
+        pipeline = plan.get("pipeline")
+        if isinstance(pipeline, dict) and "text_encoder" in pipeline:
+            source_paths["text_encoder.py"] = (
+                Path(__file__).with_name("text_encoder.py"), "text_encoder.snapshot.py",
+            )
         hashes: dict[str, str] = {}
         for name, (source_path, snapshot_name) in source_paths.items():
             if source_path.is_file():
-                hashes[name] = sha256_file(source_path)
+                snapshot_path = run_dir / snapshot_name
                 with (
                     source_path.open("rb") as source,
-                    (run_dir / snapshot_name).open("xb") as snapshot,
+                    snapshot_path.open("xb") as snapshot,
                 ):
                     snapshot.write(source.read())
+                hashes[name] = sha256_file(snapshot_path)
         write_json(run_dir / "source_hashes.json", hashes)
         write_json(run_dir / "environment.json", environment_info())
 
@@ -262,7 +276,7 @@ def execute(
         worker_error_path = run_dir / "worker_error.json"
         if worker_error_path.is_file():
             try:
-                worker_error = read_json(worker_error_path, "TRAINING_ERROR")
+                worker_error = read_json(worker_error_path, "TRAINING_ERROR", max_bytes=1024 * 1024)
                 status = worker_error.get("status")
                 if status in ("rejected", "failed"):
                     error = worker_error.get("error")

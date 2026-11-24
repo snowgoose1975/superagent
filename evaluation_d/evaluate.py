@@ -43,6 +43,8 @@ def evaluate(
     result_path: Path,
     evaluation_manifest_path: Path,
     output_path: Path | None = None,
+    *,
+    runs_root: Path | None = None,
 ) -> dict[str, Any]:
     """Score completed C artifacts while leaving result.json intact."""
     result_path = Path(result_path).expanduser().resolve(strict=True)
@@ -51,7 +53,14 @@ def evaluate(
         raise ValueError("result_path must point to C's result.json.")
 
     # The consumer validates status, prediction path, probabilities, and row structure.
-    runs_root = result_path.parents[3]
+    if runs_root is None:
+        if len(result_path.parents) < 4:
+            raise ValueError("Expected a result inside <runs>/<task>/<version>/<experiment>")
+        runs_root = result_path.parents[3]
+    else:
+        runs_root = Path(runs_root).expanduser().resolve(strict=True)
+    if not result_path.is_relative_to(runs_root):
+        raise ValueError("The result must be inside runs_root")
     relpath = result_path.relative_to(runs_root).as_posix()
     result, predictions = load_successful_predictions(relpath, runs_root)
 

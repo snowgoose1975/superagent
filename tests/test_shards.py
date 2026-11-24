@@ -15,6 +15,7 @@ import numpy as np
 
 import main as team_main
 from data_b.input_readers import normalize_prediction_input
+from data_b.input_readers import InputReaderError
 from data_b.llm_analysis import AnalysisError, resolve_layout
 from data_b.prepare import prepare_data
 from data_b.task_directory import discover_task_directory, materialize_final_test
@@ -78,6 +79,24 @@ class ShardTests(unittest.TestCase):
         self.assertEqual([r["sample_id"] for r in rows], ["a0", "a1", "b0", "b1"])
         package = prepare_data(spec, self.area / "prepared")
         self.assertEqual(package["status"], "success", package.get("error"))
+
+    def test_feature_only_test_shards_preserve_ids_and_reject_partial_labels(self):
+        self.simple_csv()
+        self.csv("test_2.csv", [["0001", 20]], header=("id", "value"))
+        self.csv("test_10.csv", [["sample-02", 21]], header=("id", "value"))
+        result = self.discover()
+        descriptor = result["test_descriptor_path"]
+        config = materialize_final_test(descriptor, self.area / "test_inputs")
+        test = json.loads(config.read_text(encoding="utf-8"))
+        self.assertIsNone(test["labels_path"])
+        self.assertEqual(test["n_samples"], 2)
+        with (config.parent / "sample_index_test.csv").open(encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([row["original_id"] for row in rows], ["0001", "sample-02"])
+        self.assertEqual([row["source_file"] for row in rows], ["test_2.csv", "test_10.csv"])
+        self.csv("test_10.csv", [["sample-02", 21, 1]])
+        with self.assertRaisesRegex(InputReaderError, "agree on label availability"):
+            materialize_final_test(descriptor, self.area / "mixed_labels")
 
     def test_tsv_shards_preserve_multiline_text(self):
         for n in (1, 2):

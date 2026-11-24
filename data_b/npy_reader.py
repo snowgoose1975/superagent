@@ -60,7 +60,14 @@ _ALLOWED_GLOBALS = {
 }
 
 
-def read_npy_array(path: Path, limits: ReaderLimits | None = None) -> np.ndarray:
+def read_npy_array(
+    path: Path,
+    limits: ReaderLimits | None = None,
+    *,
+    expected_shape: tuple[int, ...] | None = None,
+    allowed_dtype_kinds: str | None = None,
+    allowed_item_sizes: tuple[int, ...] | None = None,
+) -> np.ndarray:
     """Read primitive arrays, or object arrays through a static opcode interpreter.
 
     Large primitive arrays use a read-only memory map after header/length checks.
@@ -107,6 +114,8 @@ def read_npy_array(path: Path, limits: ReaderLimits | None = None) -> np.ndarray
             or any(type(size) is not int or size < 0 for size in shape)
         ):
             raise ValueError("Invalid .npy shape")
+        if expected_shape is not None and shape != expected_shape:
+            raise ValueError(".npy shape does not match the prepared manifest")
         count = math.prod(shape)
         if count > limits.max_elements:
             raise ValueError(".npy element count exceeds the configured limit")
@@ -123,6 +132,11 @@ def read_npy_array(path: Path, limits: ReaderLimits | None = None) -> np.ndarray
             raise ValueError("Unsupported .npy dtype") from exc
         if dtype.fields is not None or dtype.subdtype is not None:
             raise ValueError("Structured and subarray dtypes are not supported")
+        if (
+            (allowed_dtype_kinds is not None and dtype.kind not in allowed_dtype_kinds)
+            or (allowed_item_sizes is not None and dtype.itemsize not in allowed_item_sizes)
+        ):
+            raise ValueError(".npy dtype does not match the prepared input contract")
         payload_offset = stream.tell()
         payload_size = os.fstat(stream.fileno()).st_size - payload_offset
         payload_limit = min(limits.max_payload_bytes, limits.max_object_payload_bytes) if dtype.hasobject else limits.max_payload_bytes
@@ -138,7 +152,7 @@ def read_npy_array(path: Path, limits: ReaderLimits | None = None) -> np.ndarray
             if count * dtype.itemsize != payload_size:
                 raise ValueError("Primitive .npy payload size does not match its header")
             if payload_size >= limits.mmap_threshold_bytes:
-                return np.memmap(path, dtype=dtype, mode="r", offset=payload_offset,
+                return np.memmap(stream, dtype=dtype, mode="r", offset=payload_offset,
                                  shape=shape, order="F" if header["fortran_order"] else "C")
             payload = stream.read(payload_size)
 

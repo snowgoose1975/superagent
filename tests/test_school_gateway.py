@@ -1,4 +1,4 @@
-"""学校 API 网关只用注入的 HTTP 假响应验证，不发送真实请求。"""
+"""Verify the school API gateway with an injected HTTP transport."""
 
 from __future__ import annotations
 
@@ -16,8 +16,10 @@ def _config(**overrides: Any) -> dict[str, Any]:
     config = {
         "url": "https://aigc-api.hkust-gz.edu.cn/api/v2/chat/completions",
         "model": "DeepSeek-V4.1-Flash",
-        "input_cny_per_million": "0.50",
-        "output_cny_per_million": "2.00",
+        "pricing_profile": "deepseek-v4.1-flash-offpeak-2026-10-21",
+        "pricing_tier": "published off-peak, cache-miss reference rates",
+        "input_cny_per_million": "1.007880",
+        "output_cny_per_million": "4.031520",
         "max_tokens": 32,
         "max_input_tokens": 4096,
         "timeout": 90,
@@ -26,7 +28,7 @@ def _config(**overrides: Any) -> dict[str, Any]:
     return config
 
 
-def _payload(*, usage: dict[str, Any] | None = None, text: Any = "计划文本") -> bytes:
+def _payload(*, usage: dict[str, Any] | None = None, text: Any = "\u8ba1\u5212\u6587\u672c") -> bytes:
     body: dict[str, Any] = {"choices": [{"message": {"content": text}}]}
     if usage is not None:
         body["usage"] = usage
@@ -71,7 +73,7 @@ def test_interrupted_request_keeps_reservation_and_cannot_call_again(tmp_path):
     assert gateway.metadata()["usage_status"] == "unknown"
     assert gateway.metadata()["estimated_cost_rmb"] is None
     assert gateway.can_call is False
-    with pytest.raises(GatewayError, match="不能继续调用"):
+    with pytest.raises(GatewayError, match="cannot make another request"):
         gateway.call_llm([{"role": "user", "content": "do not send"}])
     assert gateway.metadata()["call_attempts"] == 1
 
@@ -85,29 +87,57 @@ def test_success_records_reservation_then_real_usage_and_safe_request(tmp_path):
         )
     )
     api_key = "runtime-key-do-not-persist"
-    messages = [{"role": "user", "content": "测试问题：只在内存传递"}]
+    messages = [{"role": "user", "content": "\u6d4b\u8bd5\u95ee\u9898\uff1a\u53ea\u5728\u5185\u5b58\u4f20\u9012"}]
     gateway = SchoolGateway(_config(), api_key, tmp_path / "sessions", transport=transport)
     result = gateway.call_llm(messages)
 
-    assert result["text"] == "计划文本"
+    assert result["text"] == "\u8ba1\u5212\u6587\u672c"
     assert result["input_tokens"] == 100
     assert result["output_tokens"] == 20
     assert type(result["cost_rmb"]) is float
-    assert result["cost_rmb"] == pytest.approx(0.00009)
+    assert result["cost_rmb"] == pytest.approx(0.0001814184)
     assert not gateway.can_call
     metadata = gateway.metadata()
     assert metadata["real_llm_calls"] == 0
     assert metadata["mock_calls"] == metadata["call_attempts"] == 1
     assert metadata["usage_status"] == "known"
     assert metadata["input_tokens"] == 100 and metadata["output_tokens"] == 20
-    assert metadata["estimated_cost_rmb"] == "0.00009"
+    assert metadata["estimated_cost_rmb"] == "0.0001814184"
     assert metadata["reserved_rmb"] == "0"
-    assert metadata["remaining_budget_rmb"] == "0.09991"
+    assert metadata["remaining_budget_rmb"] == "0.0998185816"
+    assert metadata["pricing_profile"] == "deepseek-v4.1-flash-offpeak-2026-10-21"
+    call_records = [
+        json.loads(line)
+        for line in (Path(metadata["ledger_path"]) / "calls.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert all(
+        item["pricing_profile"] == "deepseek-v4.1-flash-offpeak-2026-10-21"
+        for item in call_records
+    )
 
     request, timeout = transport.requests[0]
     assert request.full_url == _config()["url"]
     assert request.get_method() == "POST"
     assert request.get_header("Content-type") == "application/json"
+
+    assert request.get_header("Authorization") == f"Bearer {api_key}"
+    assert timeout == 90
+    sent = json.loads(request.data)
+    assert sent["messages"] == messages
+    assert sent["max_tokens"] == 32
+    assert sent["temperature"] == 0
+    assert sent["stream"] is False
+
+    calls = Path(metadata["ledger_path"], "calls.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["status"] for line in calls] == ["reserved", "complete"]
+    ledger = _ledger_text(gateway)
+    assert api_key not in repr(gateway)
+    assert api_key not in ledger
+    assert messages[0]["content"] not in ledger
+    assert "\u8ba1\u5212\u6587\u672c" not in ledger
+    assert "Authorization" not in ledger
 
 
 def test_request_timeout_cap_only_reduces_configured_timeout(tmp_path):
@@ -135,22 +165,6 @@ def test_request_timeout_cap_only_reduces_configured_timeout(tmp_path):
     gateway.call_llm(message)
 
     assert [timeout for _, timeout in transport.requests] == [90, 30, 90]
-    assert request.get_header("Authorization") == f"Bearer {api_key}"
-    assert timeout == 90
-    sent = json.loads(request.data)
-    assert sent["messages"] == messages
-    assert sent["max_tokens"] == 32
-    assert sent["temperature"] == 0
-    assert sent["stream"] is False
-
-    calls = Path(metadata["ledger_path"], "calls.jsonl").read_text(encoding="utf-8").splitlines()
-    assert [json.loads(line)["status"] for line in calls] == ["reserved", "complete"]
-    ledger = _ledger_text(gateway)
-    assert api_key not in repr(gateway)
-    assert api_key not in ledger
-    assert messages[0]["content"] not in ledger
-    assert "计划文本" not in ledger
-    assert "Authorization" not in ledger
 
 
 def test_missing_usage_is_unknown_reserves_all_remaining_budget_and_blocks(tmp_path):
@@ -275,7 +289,7 @@ def test_invalid_response_with_valid_usage_is_charged_before_failure(tmp_path):
     metadata = gateway.metadata()
     assert metadata["usage_status"] == "known"
     assert metadata["input_tokens"] == 11 and metadata["output_tokens"] == 7
-    assert metadata["estimated_cost_rmb"] == "0.0000195"
+    assert metadata["estimated_cost_rmb"] == "0.00003930732"
     assert metadata["blocked"] is True and metadata["can_call"] is False
     assert '"status": "failed_known"' in _ledger_text(gateway)
 
@@ -319,7 +333,7 @@ def test_explicit_task_budget_reserves_then_settles_known_usage(tmp_path):
         tmp_path / "task-budgets",
         "course-final",
         budget_rmb="20",
-        profile="deepseek-v4.1-flash-peak-2026-10-21",
+        profile="deepseek-v4.1-flash-offpeak-2026-10-21",
     )
     transport = FakeTransport(
         (200, {}, _payload(usage={"prompt_tokens": 100, "completion_tokens": 20}))
@@ -335,9 +349,11 @@ def test_explicit_task_budget_reserves_then_settles_known_usage(tmp_path):
     summary = task_ledger.snapshot()
     assert summary["settled_count"] == 1
     assert summary["pending_count"] == summary["unknown_count"] == 0
-    assert summary["settled_cost_rmb"] == "0.0003628368"
+    assert summary["settled_cost_rmb"] == "0.0001814184"
     metadata = gateway.metadata()
     assert metadata["task_budget"]["budget_id"] == "course-final"
+    assert metadata["estimated_cost_rmb"] == summary["settled_cost_rmb"]
+    assert metadata["pricing_profile"] == metadata["task_budget_profile"]
     assert "synthetic-only-key" not in _ledger_text(gateway)
 
 
@@ -346,7 +362,7 @@ def test_explicit_task_budget_keeps_ambiguous_request_reserved(tmp_path):
         tmp_path / "task-budgets",
         "course-unknown",
         budget_rmb="20",
-        profile="deepseek-v4.1-flash-peak-2026-10-21",
+        profile="deepseek-v4.1-flash-offpeak-2026-10-21",
     )
     gateway = SchoolGateway(
         _config(),
@@ -355,8 +371,54 @@ def test_explicit_task_budget_keeps_ambiguous_request_reserved(tmp_path):
         transport=FakeTransport(error=TimeoutError("synthetic timeout")),
         task_budget_ledger=task_ledger,
     )
-    with pytest.raises(GatewayError, match="usage 未知"):
+    with pytest.raises(GatewayError, match="Usage is unknown"):
         gateway.call_llm([{"role": "user", "content": "mock only"}])
     summary = task_ledger.snapshot()
     assert summary["unknown_count"] == 1
     assert summary["reserved_rmb"] != "0"
+
+
+def test_request_byte_limit_is_independent_of_actual_token_ceiling(tmp_path):
+    transport = FakeTransport(
+        (200, {}, _payload(usage={"prompt_tokens": 11, "completion_tokens": 2})),
+    )
+    gateway = SchoolGateway(
+        _config(max_input_tokens=10, max_input_bytes=1000),
+        "synthetic-only-key", tmp_path, transport=transport,
+    )
+    with pytest.raises(GatewayError) as error:
+        gateway.call_llm([{"role": "user", "content": "short enough for the byte limit"}])
+    assert error.value.code == "USAGE_EXCEEDS_LIMIT"
+    assert len(transport.requests) == 1
+    metadata = gateway.metadata()
+    assert metadata["max_input_bytes"] == 1000
+    assert metadata["max_input_tokens"] == 10
+    assert metadata["input_tokens"] == 11
+
+
+def test_unknown_usage_preserves_ledger_persistence_failure(tmp_path, monkeypatch):
+    ledger = TaskBudgetLedger(
+        tmp_path / "budgets", "course-unknown", budget_rmb="20",
+        profile="deepseek-v4.1-flash-offpeak-2026-10-21",
+    )
+    gateway = SchoolGateway(
+        _config(), "synthetic-only-key", tmp_path / "sessions",
+        transport=FakeTransport(error=TimeoutError("synthetic timeout")),
+        task_budget_ledger=ledger,
+    )
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic disk error")
+
+    monkeypatch.setattr(ledger, "mark_unknown", fail)
+    with pytest.raises(GatewayError) as error:
+        gateway.call_llm([{"role": "user", "content": "mock only"}])
+    assert error.value.code == "TIMEOUT"
+    assert ledger.snapshot()["pending_count"] == 1
+    metadata = gateway.metadata()
+    assert metadata["blocked_reason"] == "TIMEOUT"
+    assert metadata["task_budget_error"] == "mark_unknown_failed"
+    assert metadata["usage_status"] == "unknown"
+    monkeypatch.setattr(ledger, "snapshot", fail)
+    assert gateway.metadata()["task_budget"] is None
+    assert gateway.remaining_budget_rmb == 0.0

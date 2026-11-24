@@ -233,12 +233,12 @@ def test_planner_compacts_long_history_before_school_gateway_limit():
 def test_task_documentation_is_bounded_and_reaches_planner_with_metric_name():
     documentation = {
         "metric": {"name": "f1_macro"},
-        "objective": "预测分类标签。" * 1000,
-        "description": '说明：\\\n"' * 5000,
-        "input_columns": [f"中文特征_{index}" * 40 for index in range(100)],
+        "objective": "\u9884\u6d4b\u5206\u7c7b\u6807\u7b7e\u3002" * 1000,
+        "description": '\u8bf4\u660e\uff1a\\\n"' * 5000,
+        "input_columns": [f"\u4e2d\u6587\u7279\u5f81_{index}" * 40 for index in range(100)],
         "target_column": "target",
         "task_type": "classification",
-        "label_semantics": {"0": "拒绝", "1": "接受"},
+        "label_semantics": {"0": "\u62d2\u7edd", "1": "\u63a5\u53d7"},
         "raw_rows": ["must not be included"],
         "test_labels": ["must not be included"],
     }
@@ -293,7 +293,7 @@ def test_task_documentation_yields_to_full_experiment_history_near_input_limit()
     planner = LLMPlanner(lambda _messages: None, Planner(), max_input_bytes=max_bytes)
     user = planner._user_message({
         **base_context,
-        "task_context": {"objective": "分类" * 5000, "metric": "accuracy"},
+        "task_context": {"objective": "\u5206\u7c7b" * 5000, "metric": "accuracy"},
     }, system_message=system)
     payload = json.loads(user)
     assert "task_context" not in payload

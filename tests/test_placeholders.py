@@ -143,11 +143,11 @@ def test_evaluator_aligns_shuffled_labels_by_sample_id(tmp_path: Path) -> None:
 def test_evaluator_rejects_duplicate_or_missing_label_ids(tmp_path: Path) -> None:
     result_path, eval_path, labels_path = _evaluation_case(tmp_path)
     labels_path.write_text("sample_id,y_true\nsample-a,0\nsample-a,1\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="重复"):
+    with pytest.raises(ValueError, match="duplicate"):
         evaluate(result_path, eval_path)
 
     labels_path.write_text("sample_id,y_true\nsample-a,0\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="集合不一致"):
+    with pytest.raises(ValueError, match="mismatched sample ID sets"):
         evaluate(result_path, eval_path)
 
 
@@ -155,7 +155,7 @@ def test_evaluator_rejects_duplicate_or_missing_label_ids(tmp_path: Path) -> Non
     ("mutation", "message"),
     [
         ("task", "task_id/data_version"),
-        ("metric", "只接受 primary_metric=accuracy"),
+        ("metric", "primary_metric must be accuracy"),
     ],
 )
 def test_evaluator_rejects_wrong_task_or_metric(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -48,8 +49,16 @@ def predict_bundle(
 
         if "reader_rules.json" not in bundle["hashes"] or source_root is None:
             raise ValueError("Raw inference requires frozen reader_rules.json and source_root")
-        root = Path(source_root).resolve(strict=True)
-        features = Path(features_path).resolve(strict=True)
+        root = Path(source_root).expanduser().resolve(strict=True)
+        requested_features = Path(os.path.abspath(Path(features_path).expanduser()))
+        if not requested_features.is_relative_to(root):
+            raise ValueError("Raw prediction source must be inside source_root")
+        current = requested_features
+        while current != root:
+            if current.is_symlink():
+                raise ValueError("Symlinked raw prediction sources are unsupported")
+            current = current.parent
+        features = requested_features.resolve(strict=True)
         if not features.is_relative_to(root):
             raise ValueError("Raw prediction source must be inside source_root")
         normalized = Path(output_path).resolve().parent / ("converted_" + uuid.uuid4().hex) / "X.npy"

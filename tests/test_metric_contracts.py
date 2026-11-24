@@ -49,5 +49,5 @@ def test_metric_spec_rejects_wrong_direction_or_unknown_name(spec):
 
 def test_score_rejects_unknown_true_label_but_accepts_missing_validation_class():
     assert score_predictions("f1_macro", [0, 0], [0, 0], [[0.9, 0.1], [0.8, 0.2]], [0, 1]) == 0.5
-    with pytest.raises(ValueError, match="未知类别"):
+    with pytest.raises(ValueError, match="unknown class"):
         score_predictions("accuracy", [2], [0], [[1.0, 0.0]], [0, 1])

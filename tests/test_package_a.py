@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent_a.controller import PackageAController
 from executor_c.contracts import capabilities
+from executor_c.model_registry import runtime_capabilities
 
 
 def make_context(history=None, remaining=3, n_train=120):
@@ -98,11 +99,14 @@ def test_expanded_profile_covers_each_supported_dense_model_family():
     )
     history = []
     selected = []
-    for trial in range(4):
+    catalogue = runtime_capabilities(
+        "dense_numeric", min_class_count=10, native_table=False, performance=False,
+    )
+    for trial in range(len(catalogue["models"])):
         decision = controller.decide(
             {
                 **make_context(history, remaining=12 - trial),
-                "capabilities": capabilities(),
+                "capabilities": catalogue,
             }
         )
         assert decision["action"] == "run"
@@ -110,7 +114,7 @@ def test_expanded_profile_covers_each_supported_dense_model_family():
         history.append(
             entry(controller, decision["model"], decision["params"], value=0.6)
         )
-    assert set(selected) == set(capabilities()["models"])
+    assert set(selected) == set(catalogue["models"])
 
 
 def test_expanded_patience_starts_after_minimum_exploration_and_ignores_failures():

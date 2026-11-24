@@ -46,6 +46,7 @@ def load_search_config(path: str | Path) -> dict[str, Any]:
         not isinstance(offsets, list)
         or len(offsets) > 2
         or any(type(offset) is not int or not 1 <= offset <= 2**32 - 1 for offset in offsets)
+        or len(set(offsets)) != len(offsets)
     ):
-        raise ValueError("confirmation_seed_offsets accepts at most two positive integer offsets")
+        raise ValueError("confirmation_seed_offsets accepts at most two distinct positive integer offsets")
     return value
