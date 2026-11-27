@@ -54,8 +54,9 @@ def _terminate(proc: subprocess.Popen[Any]) -> None:
         pass
     finally:
         try:
-            proc.wait()
-        except OSError:
+            # A worker stuck in uninterruptible I/O cannot be reaped; never block forever.
+            proc.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
 
@@ -325,9 +326,10 @@ def execute(
     except _Finished:
         pass
     except KeyboardInterrupt:
+        # Decide to suppress the terminal before cleanup: cleanup may itself be interrupted.
+        publish_terminal = False
         if proc is not None:
             _terminate(proc)
-        publish_terminal = False
         raise
     except Exception as exc:
         code, message = _error_parts(exc, "TRAINING_ERROR")

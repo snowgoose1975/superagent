@@ -5,7 +5,7 @@
   "pricing_tier": "published off-peak, cache-miss reference rates",
   "input_cny_per_million": "1.007880",
   "output_cny_per_million": "4.031520",
-  "max_tokens": 1024,
+  "max_tokens": 4096,
   "max_input_tokens": 16384,
   "max_input_bytes": 16384,
   "timeout": 90

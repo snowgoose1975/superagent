@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import sys
 import time
 import traceback
@@ -107,7 +108,7 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
     random_seed: int | None = None
     data = None
     model = None
-    fit_complete = False
+    effective_iterations: int | None = None
     timings: dict[str, float | None] = {
         "input": None, "fit": None, "predict": None, "serialize": None,
         "reload_check": None, "total": None,
@@ -142,9 +143,7 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
                         else None
                     ),
                     random_seed=random_seed,
-                    effective_iterations=(
-                        _effective_iterations(model) if fit_complete and model is not None else None
-                    ),
+                    effective_iterations=effective_iterations,
                     warnings=captured_warnings,
                     warnings_truncated=warnings_truncated,
                     failure=failure,
@@ -227,7 +226,7 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             model.fit(X_train, data.y_train)
-        fit_complete = True
+        effective_iterations = _effective_iterations(model)
         timings["fit"] = time.perf_counter() - fit_started
         warnings_truncated = len(caught) > 20
         captured_warnings = [
@@ -259,11 +258,14 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
         phase = "reload_check"
         snapshot("running")
         reload_started = time.perf_counter()
-        restored = joblib.load(model_path)
         probe_size = min(len(data.X_valid), 5)
         # Compare identical batch shapes: float32 kernels may round differently
         # for a short probe than for the full validation matrix.
         probe_pred, probe_prob = _ordered_predictions(model, X_valid[:probe_size], data.class_ids)
+        # Drop the in-memory model before loading the copy so both never coexist.
+        del model
+        gc.collect()
+        restored = joblib.load(model_path)
         restored_pred, restored_prob = _ordered_predictions(
             restored, X_valid[:probe_size], data.class_ids
         )
@@ -271,6 +273,8 @@ def run(plan_path: Path, manifest_path: Path, run_dir: Path) -> None:
             restored_prob, probe_prob, rtol=0.0, atol=1e-12
         ):
             raise RuntimeError("The saved model predictions changed after reloading")
+        del restored
+        gc.collect()
         timings["reload_check"] = time.perf_counter() - reload_started
 
         prediction_path = run_dir / "predictions.csv"
